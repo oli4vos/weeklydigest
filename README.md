@@ -232,6 +232,7 @@ Nieuwe berichten worden via `TelegramService.store_from_payload` opgeslagen, waa
 - `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` voor Basic Auth.
 - `INTERNAL_TRIGGER_TOKEN` voor de beveiligde `/internal/run/*` endpoints (gebruik je ook in GitHub Actions).
 - SMTP/Telegram variabelen blijven hetzelfde.
+- Datums/timestamps blijven in UTC opgeslagen in de database; weergave gebeurt in `APP_TIMEZONE`.
 
 ## Deployment via GitHub + Render
 Gebruik desgewenst `render.yaml` (in deze repo) als Render Blueprint, of configureer handmatig:

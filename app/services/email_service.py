@@ -54,12 +54,16 @@ class EmailService:
         summary_text = f"{report.source_message_count} berichten · {report.source_resource_count} bronnen"
         if themes.get("story"):
             summary_text += f" — {themes['story']}"
+        duplicates_filtered_count = int(themes.get("duplicates_filtered_count") or 0)
 
         primary_insight = report.reflection or themes.get("platform_story") or report.meta_analysis or summary_text
 
         sections: list[str] = []
         sections.append(f"<h1 style='{self._heading_style(level=1)}'>Weekly Digest</h1>")
         sections.append(f"<p style='{self._paragraph_style()}'><strong>Samenvatting:</strong> {escape(summary_text)}</p>")
+        sections.append(
+            f"<p style='{self._paragraph_style()}'>Voor dit overzicht zijn {duplicates_filtered_count} dubbele items verwijderd.</p>"
+        )
         sections.append(
             "<div style='background:#f3f4f6;padding:12px 16px;border-radius:8px;margin:16px 0;'>"
             "<strong>Belangrijkste inzicht:</strong><br/>"

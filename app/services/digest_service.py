@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha1
 from textwrap import shorten
-from urllib.parse import urlparse
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from app.db import get_session
 from app.models import RawMessage, Resource, WeeklyReport
 from app.repositories.weekly_report_repository import WeeklyReportRepository
+from app.utils.datetime_utils import format_datetime_for_display
 
 
 class DigestService:
@@ -109,8 +112,9 @@ class DigestService:
         format_counts = Counter((res.content_format or "unknown") for res in external_resources)
         domain_counts = Counter((res.domain or "unknown") for res in external_resources)
 
-        highlights = self._build_highlights(external_resources, ideas)
+        highlights, duplicates_filtered_count = self._build_highlights(external_resources, ideas)
         themes = self._build_themes(platform_counts, format_counts, domain_counts, note_count, len(external_resources))
+        themes["duplicates_filtered_count"] = duplicates_filtered_count
         links_overview = self._links_overview(external_resources)
         actions = self._action_items(ideas, highlights, themes, links_overview)
         reflection = self._build_reflection(message_count, len(external_resources), note_count, themes, links_overview)
@@ -122,6 +126,7 @@ class DigestService:
             subject=subject,
             intro=intro_summary,
             highlights=highlights,
+            duplicates_filtered_count=duplicates_filtered_count,
             themes=themes,
             notes=ideas,
             links=links_overview,
@@ -145,8 +150,9 @@ class DigestService:
             "generated_at": datetime.now(timezone.utc),
         }
 
-    def _build_highlights(self, resources: List[Resource], ideas: List[Dict]) -> List[Dict]:
+    def _build_highlights(self, resources: List[Resource], ideas: List[Dict]) -> Tuple[List[Dict], int]:
         highlights: List[Dict] = []
+        duplicates_filtered_count = 0
         seen_note_keys = set()
         target_max = 5
         # 1) Prioritize strong own notes (literal snippets, no duplicates)
@@ -173,7 +179,8 @@ class DigestService:
                 break
 
         # 2) Add strong external resources while filtering noise and duplicates.
-        seen_urls = set()
+        seen_resource_keys = set()
+        seen_titles_by_base_key: Dict[str, set[str]] = {}
         candidates = [
             res
             for res in resources
@@ -187,10 +194,25 @@ class DigestService:
             reverse=True,
         )
         for res in candidates:
-            url_key = self._resource_dedupe_key(res)
-            if url_key in seen_urls:
+            base_key = self._resource_dedupe_key(res)
+            dedupe_key = base_key
+            if not dedupe_key:
+                duplicates_filtered_count += 1
                 continue
-            seen_urls.add(url_key)
+
+            title_signature = self._title_signature(res.title)
+            known_title_signatures = seen_titles_by_base_key.get(base_key, set())
+            if dedupe_key in seen_resource_keys:
+                # Keep items apart when a URL key collides but titles clearly describe different content.
+                if title_signature and known_title_signatures and title_signature not in known_title_signatures:
+                    dedupe_key = f"{base_key}::title:{sha1(title_signature.encode('utf-8')).hexdigest()[:10]}"
+                else:
+                    duplicates_filtered_count += 1
+                    continue
+
+            seen_resource_keys.add(dedupe_key)
+            if title_signature:
+                seen_titles_by_base_key.setdefault(base_key, set()).add(title_signature)
             detail_text = shorten(self._resource_importance(res), width=110, placeholder="…")
             highlights.append(
                 {
@@ -218,7 +240,7 @@ class DigestService:
                 },
             )
             highlights = highlights[:target_max]
-        return highlights[:target_max]
+        return highlights[:target_max], duplicates_filtered_count
 
     def _plain_text_notes(self, messages: List[RawMessage]) -> List[Dict]:
         notes = []
@@ -227,7 +249,7 @@ class DigestService:
                 continue
             notes.append(
                 {
-                    "received_at": msg.received_at.isoformat(timespec="minutes"),
+                    "received_at": format_datetime_for_display(msg.received_at),
                     "text": msg.text.strip(),
                 }
             )
@@ -462,12 +484,54 @@ class DigestService:
         return False
 
     def _resource_dedupe_key(self, res: Resource) -> str:
-        raw = (res.canonical_url or res.final_url or res.url or "").strip().lower()
-        if not raw:
+        raw_url = (res.canonical_url or res.final_url or res.url or "").strip()
+        if not raw_url:
             return ""
-        parsed = urlparse(raw)
-        normalized = f"{parsed.netloc}{parsed.path}".rstrip("/")
-        return normalized or raw
+        parsed = urlparse(raw_url)
+        if not parsed.scheme or not parsed.netloc:
+            return raw_url.lower()
+
+        domain = parsed.netloc.lower().replace("www.", "")
+        path_full = parsed.path or "/"
+        path_lower = path_full.lower()
+        is_linkedin_post = domain.endswith("linkedin.com") and (
+            "linkedin.com/posts/" in raw_url.lower()
+            or "linkedin.com/feed/update/" in raw_url.lower()
+            or "/pulse/" in path_lower
+        )
+
+        filtered_qs = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not (
+                key.lower().startswith("utm_")
+                or key.lower() in {"igsh", "si", "feature", "fbclid", "gclid", "mc_cid", "mc_eid", "trk", "trackingid"}
+            )
+        ]
+        filtered_qs.sort()
+        normalized_query = urlencode(filtered_qs, doseq=True)
+
+        normalized = parsed._replace(
+            netloc=domain,
+            path=(path_full.rstrip("/") or "/"),
+            query=normalized_query,
+            fragment="",
+        )
+        if is_linkedin_post:
+            # Keep full LinkedIn post path/slug so separate posts never collapse.
+            linkedin_key = f"linkedin_post::{domain}{path_full}"
+            if normalized_query:
+                linkedin_key = f"{linkedin_key}?{normalized_query}"
+            return linkedin_key
+        return urlunparse(normalized)
+
+    def _title_signature(self, title: Optional[str]) -> str:
+        value = (title or "").strip().lower()
+        if not value:
+            return ""
+        normalized = re.sub(r"\s+", " ", value)
+        normalized = re.sub(r"[^a-z0-9 ]+", "", normalized)
+        return normalized[:120]
 
     def _resource_why_relevant(self, res: Resource) -> str:
         fmt = (res.content_format or "").lower()
@@ -498,6 +562,7 @@ class DigestService:
         subject: str,
         intro: str,
         highlights: List[Dict],
+        duplicates_filtered_count: int,
         themes: Dict,
         notes: List[Dict],
         links: Dict[str, List[Dict]],
@@ -510,6 +575,7 @@ class DigestService:
         lines.append("Intro")
         lines.append("-----")
         lines.append(intro)
+        lines.append(f"Voor dit overzicht zijn {duplicates_filtered_count} dubbele items verwijderd.")
         lines.append("")
         if highlights:
             lines.append("Highlights")
@@ -521,6 +587,8 @@ class DigestService:
                     lines.append(f"- {hl['title']} — {hl['detail']}")
                     if hl.get("url"):
                         lines.append(f"  {hl['url']}")
+                if hl.get("why_relevant"):
+                    lines.append(f"  Waarom dit relevant is: {hl['why_relevant']}")
             lines.append("")
         if themes.get("story"):
             lines.append("Thema’s")
