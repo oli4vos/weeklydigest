@@ -1,0 +1,32 @@
+name: Trigger Daily Digest
+
+on:
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+
+jobs:
+  call-endpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call internal daily endpoint
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          INTERNAL_TRIGGER_TOKEN: ${{ secrets.INTERNAL_TRIGGER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_BASE_URL:-}" ] || [ -z "${INTERNAL_TRIGGER_TOKEN:-}" ]; then
+            echo "APP_BASE_URL and INTERNAL_TRIGGER_TOKEN secrets must be set." >&2
+            exit 1
+          fi
+          STATUS=$(curl -s -o response.json -w "%{http_code}" \
+            -X POST "${APP_BASE_URL}/internal/run/daily" \
+            -H "X-Internal-Token: ${INTERNAL_TRIGGER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          cat response.json
+          if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
+            echo "Request failed with HTTP ${STATUS}" >&2
+            exit 1
+          fi

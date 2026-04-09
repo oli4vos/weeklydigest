@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.env
+*.pyc
+knowledge.db
+.DS_Store
+*.log
+
+knowledge.db.pre-multi-user-backup

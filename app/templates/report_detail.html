@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Rapport #{{ report.id }}</h2>
+  <p><strong>Onderwerp:</strong> {{ report.email_subject or "Weekly Digest" }}</p>
+  <p><strong>Periode:</strong> {{ report.week_start }} → {{ report.week_end }}</p>
+  <p><strong>Status:</strong> {{ report.status or "generated" }}</p>
+  <p><strong>Generated at:</strong> {{ report.generated_at or "–" }}</p>
+  <p><strong>Sent at:</strong> {{ report.sent_at or "–" }}</p>
+</div>
+
+<div class="card">
+  <h3>E-mail body</h3>
+  <pre>{{ report.email_body }}</pre>
+</div>
+
+<div class="card">
+  <h3>Highlights JSON</h3>
+  <pre>{{ report.highlights_json | tojson(indent=2) }}</pre>
+</div>
+
+<div class="card">
+  <h3>Themes JSON</h3>
+  <pre>{{ report.themes_json | tojson(indent=2) }}</pre>
+</div>
+
+<div class="card">
+  <h3>Actions JSON</h3>
+  <pre>{{ report.actions_json | tojson(indent=2) }}</pre>
+</div>
+{% endblock %}

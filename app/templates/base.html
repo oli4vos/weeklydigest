@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="nl">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ title or "Knowledge Inbox" }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #f5f7fb;
+        color: #0f172a;
+      }
+      header {
+        background: #0f172a;
+        color: #fff;
+        padding: 16px;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 20px;
+      }
+      nav a {
+        color: #e2e8f0;
+        margin-right: 16px;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      main {
+        max-width: 960px;
+        margin: 24px auto;
+        padding: 0 16px 32px;
+      }
+      .card {
+        background: #fff;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        padding: 8px 12px;
+        border-bottom: 1px solid #e2e8f0;
+        text-align: left;
+      }
+      th {
+        background: #f8fafc;
+        font-size: 14px;
+        text-transform: uppercase;
+        color: #475569;
+      }
+      .actions form {
+        display: inline;
+        margin-right: 8px;
+      }
+      button {
+        background: #2563eb;
+        color: #fff;
+        border: none;
+        padding: 8px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.secondary {
+        background: #0f172a;
+      }
+      .message {
+        background: #dcfce7;
+        color: #065f46;
+        border-radius: 6px;
+        padding: 12px;
+        margin-bottom: 16px;
+      }
+      pre {
+        background: #f1f5f9;
+        padding: 12px;
+        border-radius: 6px;
+        overflow-x: auto;
+      }
+      a {
+        color: #2563eb;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Knowledge Inbox</h1>
+      <nav>
+        <a href="/">Dashboard</a>
+        <a href="/reports">Rapporten</a>
+      </nav>
+    </header>
+    <main>
+      {% if message %}
+      <div class="message">{{ message }}</div>
+      {% endif %} {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

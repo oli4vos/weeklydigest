@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Acties</h2>
+  <div class="actions">
+    <form method="post" action="/run/daily">
+      <button type="submit">Start daily digest</button>
+    </form>
+    <form method="post" action="/run/weekly">
+      <button type="submit" class="secondary">Start weekly digest</button>
+    </form>
+    <form method="post" action="/run/extraction">
+      <button type="submit">Run extraction</button>
+    </form>
+  </div>
+  <p style="margin-top:12px;color:#475569;">
+    De dagelijkse job verstuurt het rapport van vandaag; de wekelijkse job kijkt 7 dagen
+    terug. Extraction vult de resources bij.
+  </p>
+</div>
+
+<div class="card">
+  <h2>Laatste rapporten</h2>
+  {% if reports %}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Periode</th>
+        <th>Status</th>
+        <th>Sent at</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for report in reports %}
+      <tr>
+        <td>{{ report.id }}</td>
+        <td>{{ report.week_start }} → {{ report.week_end }}</td>
+        <td>{{ report.status or "generated" }}</td>
+        <td>{{ report.sent_at or "–" }}</td>
+        <td><a href="/reports/{{ report.id }}">bekijk</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>Er zijn nog geen rapporten.</p>
+  {% endif %}
+</div>
+{% endblock %}
