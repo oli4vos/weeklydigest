@@ -36,6 +36,7 @@ Een lokale Python-applicatie die inkomende berichten verzamelt, links opslaat en
    - `DEFAULT_USER_ID`: standaard user voor handmatige runs (default `1`).
    - `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`: Basic Auth credentials voor het dashboard (default `admin`/`admin` – wijzig dit!).
    - `INTERNAL_TRIGGER_TOKEN`: shared secret om de interne endpoints (`/internal/run/*`) te triggeren vanuit GitHub Actions of andere schedulers.
+   - `EMAIL_VERIFICATION_CODE_TTL_MINUTES`: verloopduur van verificatiecodes voor Telegram onboarding (default `15`).
 
 ## Database initialiseren
 Voer het init-script uit nadat de virtuele omgeving actief is en de `.env` klaar staat:
@@ -43,6 +44,10 @@ Voer het init-script uit nadat de virtuele omgeving actief is en de `.env` klaar
 python scripts/init_db.py
 ```
 Dit maakt `knowledge.db` in de projectroot aan en creëert alle tabellen.
+Werk je met een bestaande database? Draai dan ook:
+```bash
+python scripts/migrate_user_onboarding.py
+```
 
 ## Telegram-bot draaien
 1. Vraag bij [@BotFather](https://t.me/BotFather) een bot aan en noteer de token.
@@ -52,12 +57,15 @@ Dit maakt `knowledge.db` in de projectroot aan en creëert alle tabellen.
    ```bash
    python scripts/run_bot.py
    ```
-5. Stuur een tekstbericht naar je bot. Het bericht verschijnt als rij in `raw_messages` met `source='telegram'`. Links worden gedetecteerd via een eenvoudige regex en gemarkeerd in `contains_link`.
+5. Stuur `/start` naar je bot om onboarding te starten (e-mail invoeren + code verifiëren).
+6. Na onboarding worden tekstberichten opgeslagen in `raw_messages` met `source='telegram'`. Links worden gedetecteerd via regex en gemarkeerd in `contains_link`.
 
 ### Multi-user basis
-- Elke unieke Telegram-gebruiker wordt automatisch aangemaakt in de tabel `users` met zijn/haar chat-id, username en optionele e-mailvelden.
-- Alle `raw_messages`, `knowledge_items` en `weekly_reports` koppelen via `user_id`, waardoor meerdere gebruikers veilig naast elkaar bestaan en later eigen e-mailflows kunnen krijgen.
-- Als je het schema hebt gewijzigd, verwijder (of hernoem) `knowledge.db` en draai `python scripts/init_db.py` opnieuw zodat de nieuwe tabellen en kolommen worden aangemaakt.
+- Elke unieke Telegram-gebruiker wordt automatisch aangemaakt in `users` op basis van `telegram_user_id`.
+- Onboarding-statusflow: `new` → `awaiting_email` → `awaiting_email_verification` → `active`.
+- Telefoonnummer is optioneel; delen gaat via Telegram contact share (`request_contact=True`).
+- Berichten vóór verificatie worden al opgeslagen, maar digestmails gaan alleen naar users met `email_verified=true`.
+- Bij upgrades op bestaande databases: run eenmalig `python scripts/migrate_user_onboarding.py` (additieve migratie, geen drop/reset).
 
 ### Teststappen (SQLite CLI)
 1. Initialiseer opnieuw:
@@ -155,11 +163,14 @@ python scripts/send_weekly_report.py --report-id 3
 python scripts/send_weekly_report.py --latest --user-id 1
 ```
 Gebruik `--force` om een eerder verzonden rapport opnieuw te sturen. SMTP-configuratie komt uit `.env` (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`).
+Zonder `--to` probeert het script automatisch te verzenden naar de geverifieerde e-mail van de report-user.
 
 ### 3. End-to-end test
 `scripts/run_weekly_digest.py` combineert beide stappen:
 ```bash
 python scripts/run_weekly_digest.py --user-id 1 --days 7 --force
+# of voor alle geverifieerde users:
+python scripts/run_weekly_digest.py --all-verified --days 7 --force
 ```
 Gebruik `--dry-run` om alleen te genereren en de e-mailtekst te printen zonder te versturen.
 
@@ -226,7 +237,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 Open daarna http://localhost:8000:
 
-- **Dashboard (`/`)** – toont de laatste 10 rapporten en knoppen om daily/weekly digests of extraction te triggeren.
+- **Dashboard (`/`)** – toont rapporten, recente input/resources en onboarding-status van users.
 - **Reports (`/reports`)** – overzicht van recente rapporten.
 - **Report detail (`/reports/{id}`)** – onderwerp, periodes, e-mail body + JSON samenvattingen.
 - **Acties** – `POST /run/daily`, `/run/weekly`, `/run/extraction` (via HTML forms of direct HTTP-calls).
@@ -234,6 +245,7 @@ Open daarna http://localhost:8000:
 Alle routes hergebruiken `DigestService`, `EmailService` en `ExtractionService`; er is geen duplicate logica.
 Dashboard- en run-routes zijn beveiligd met Basic Auth; gebruik `DASHBOARD_USERNAME` en `DASHBOARD_PASSWORD`.
 Als er geen activiteit is (0 berichten + 0 bronnen) wordt het rapport wel opgeslagen maar krijgt status `skipped_empty` en er wordt geen mail gestuurd.
+Daily/weekly runs via dashboard of `/internal/run/*` verwerken alle users met `is_active=true`, `email_verified=true` en een ingevuld e-mailadres.
 
 ### Telegram webhook
 Het endpoint `POST /telegram/webhook` accepteert reguliere Telegram update payloads. Om lokaal te testen:
@@ -247,13 +259,14 @@ cloudflared tunnel --url http://localhost:8000
 curl \"https://api.telegram.org/bot<token>/setWebhook?url=https://<tunnel-domain>/telegram/webhook\"
 ```
 
-Nieuwe berichten worden via `TelegramService.store_from_payload` opgeslagen, waardoor polling optioneel blijft. In productie wijs je de webhook naar de publieke URL van je FastAPI-app.
+Nieuwe berichten worden via `TelegramService.store_from_payload` verwerkt (inclusief onboarding, e-mailverificatie en optionele contact-share), waardoor polling optioneel blijft.
 
 ### Config
-- `DEFAULT_USER_ID` (nieuw) bepaalt welke gebruiker standaard gebruikt wordt voor de web-acties.
+- `DEFAULT_USER_ID` bepaalt de fallback user voor handmatige scripts.
 - `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` voor Basic Auth.
 - `INTERNAL_TRIGGER_TOKEN` voor de beveiligde `/internal/run/*` endpoints (gebruik je ook in GitHub Actions).
-- SMTP/Telegram variabelen blijven hetzelfde.
+- `EMAIL_VERIFICATION_CODE_TTL_MINUTES` bepaalt hoe lang onboardingcodes geldig zijn.
+- SMTP/Telegram variabelen blijven verder hetzelfde.
 - Datums/timestamps blijven in UTC opgeslagen in de database; weergave gebeurt in `APP_TIMEZONE`.
 
 ## Deployment via GitHub + Render
@@ -277,6 +290,7 @@ Gebruik desgewenst `render.yaml` (in deze repo) als Render Blueprint, of configu
      - `TELEGRAM_BOT_TOKEN`
      - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`
      - `EMAIL_FROM`, `EMAIL_TO`
+     - `EMAIL_VERIFICATION_CODE_TTL_MINUTES`
      - `APP_TIMEZONE` (bijv. `Europe/Amsterdam`)
      - `DEFAULT_USER_ID` (meestal `1`)
      - `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`
@@ -285,6 +299,7 @@ Gebruik desgewenst `render.yaml` (in deze repo) als Render Blueprint, of configu
    - Open de Render Shell (of background job) en voer één keer uit:
      ```bash
      python scripts/init_db.py
+     python scripts/migrate_user_onboarding.py
      ```
    - Hierdoor worden alle tabellen in Postgres aangemaakt. Doe dit alleen bij de eerste deploy of na schemawijzigingen.
 5. **Telegram webhook koppelen**

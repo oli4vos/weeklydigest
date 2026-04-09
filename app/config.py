@@ -52,6 +52,7 @@ class Settings:
     email_to: Optional[str] = os.getenv("EMAIL_TO")
     app_timezone: str = os.getenv("APP_TIMEZONE", "UTC")
     default_user_id: int = int(os.getenv("DEFAULT_USER_ID", "1"))
+    email_verification_code_ttl_minutes: int = int(os.getenv("EMAIL_VERIFICATION_CODE_TTL_MINUTES", "15"))
     dashboard_username: str = os.getenv("DASHBOARD_USERNAME", "admin")
     dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "admin")
     internal_trigger_token: Optional[str] = os.getenv("INTERNAL_TRIGGER_TOKEN")

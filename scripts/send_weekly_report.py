@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import get_settings  # noqa: E402
 from app.db import get_session  # noqa: E402
+from app.repositories.user_repository import UserRepository  # noqa: E402
 from app.repositories.weekly_report_repository import WeeklyReportRepository  # noqa: E402
 from app.services.email_service import EmailService  # noqa: E402
 
@@ -45,8 +46,11 @@ def main() -> None:
             raise ValueError("No report found for the provided criteria.")
         if (report.status or "").lower() == "sent" and not args.force:
             raise ValueError("Report already sent. Use --force to resend.")
-
-        email_service.send_report(report, to_address=args.to)
+        user_email = None
+        user = UserRepository.find_by_id(session, report.user_id)
+        if user and user.email_verified and user.email:
+            user_email = user.email
+        email_service.send_report(report, to_address=args.to or user_email)
         WeeklyReportRepository.mark_sent(session, report, datetime.now(timezone.utc))
         session.commit()
     logging.info("Report %s sent successfully.", report.id)

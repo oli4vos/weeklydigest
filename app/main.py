@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import BASE_DIR, get_settings
 from app.db import get_session
 from app.models import RawMessage, Resource
+from app.repositories.user_repository import UserRepository
 from app.repositories.weekly_report_repository import WeeklyReportRepository
 from app.services.digest_service import DigestService
 from app.services.email_service import EmailService
@@ -80,6 +81,9 @@ def dashboard(
         .limit(10)
         .all()
     )
+    recent_users = UserRepository.list_recent(db, limit=10)
+    user_count = UserRepository.count_all(db)
+    digest_recipients = UserRepository.list_digest_recipients(db)
     status_rows = (
         db.query(Resource.extraction_status)
         .filter(Resource.extraction_status.isnot(None))
@@ -110,6 +114,9 @@ def dashboard(
             "recent_messages": recent_messages,
             "recent_resources": recent_resources,
             "latest_digest": latest_digest,
+            "user_count": user_count,
+            "digest_recipient_count": len(digest_recipients),
+            "recent_users": recent_users,
             "extraction_counts": extraction_counts,
             "extraction_total": len(status_rows),
             "latest_extraction": latest_extraction,
@@ -225,47 +232,97 @@ def _run_digest(days: int) -> dict:
     end = date.today()
     start = end - timedelta(days=days - 1)
     digest_service = DigestService()
-    report = digest_service.generate_report(
-        user_id=settings.default_user_id,
-        start=start,
-        end=end,
-        force=True,
-    )
     label = "daily" if days == 1 else f"{days}-day"
-    base_info = {
+    base_info: dict[str, object] = {
         "ok": True,
-        "status": "sent",
-        "report_id": report.id,
+        "status": "processed",
         "start": str(start),
         "end": str(end),
+        "processed_users": 0,
+        "sent": 0,
+        "skipped_empty": 0,
+        "failed": 0,
+        "reports": [],
     }
 
-    if (report.source_message_count or 0) == 0 and (report.source_resource_count or 0) == 0:
-        with get_session() as session:
-            stored = session.get(type(report), report.id)
-            if stored:
-                stored.status = "skipped_empty"
-                stored.sent_at = None
-        base_info["status"] = "skipped_empty"
-        base_info["message"] = (
-            f"{label.capitalize()} digest {report.id} over {start} → {end} overgeslagen (geen activity)"
-        )
-        return base_info
-
-    try:
-        EmailService().send_report(report)
-    except Exception as exc:  # pragma: no cover
-        logger.exception("Failed to send digest %s: %s", report.id, exc)
-        base_info["status"] = "failed"
-        base_info["ok"] = False
-        base_info["message"] = f"{label.capitalize()} digest {report.id} kon niet gestuurd worden: {exc}"
-        return base_info
-
     with get_session() as session:
-        refreshed = session.get(type(report), report.id)
-        if refreshed:
-            WeeklyReportRepository.mark_sent(session, refreshed, datetime.now(timezone.utc))
+        recipients = UserRepository.list_digest_recipients(session)
+    if not recipients:
+        base_info["status"] = "skipped_no_recipients"
+        base_info["message"] = "Geen geverifieerde gebruikers met e-mailadres gevonden."
+        return base_info
+
+    email_service = EmailService()
+    for user in recipients:
+        base_info["processed_users"] = int(base_info["processed_users"]) + 1
+        user_result: dict[str, object] = {"user_id": user.id}
+        try:
+            report = digest_service.generate_report(
+                user_id=user.id,
+                start=start,
+                end=end,
+                force=True,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to generate digest for user %s: %s", user.id, exc)
+            base_info["failed"] = int(base_info["failed"]) + 1
+            user_result["status"] = "failed_generate"
+            user_result["error"] = str(exc)
+            cast_reports = base_info["reports"]
+            if isinstance(cast_reports, list):
+                cast_reports.append(user_result)
+            continue
+
+        user_result["report_id"] = report.id
+        if (report.source_message_count or 0) == 0 and (report.source_resource_count or 0) == 0:
+            with get_session() as session:
+                stored = session.get(type(report), report.id)
+                if stored:
+                    stored.status = "skipped_empty"
+                    stored.sent_at = None
+            base_info["skipped_empty"] = int(base_info["skipped_empty"]) + 1
+            user_result["status"] = "skipped_empty"
+            cast_reports = base_info["reports"]
+            if isinstance(cast_reports, list):
+                cast_reports.append(user_result)
+            continue
+
+        try:
+            email_service.send_report(report, to_address=user.email)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to send digest report=%s user=%s: %s", report.id, user.id, exc)
+            with get_session() as session:
+                stored = session.get(type(report), report.id)
+                if stored:
+                    stored.status = "failed"
+                    stored.sent_at = None
+            base_info["failed"] = int(base_info["failed"]) + 1
+            user_result["status"] = "failed_send"
+            user_result["error"] = str(exc)
+            cast_reports = base_info["reports"]
+            if isinstance(cast_reports, list):
+                cast_reports.append(user_result)
+            continue
+
+        with get_session() as session:
+            refreshed = session.get(type(report), report.id)
+            if refreshed:
+                WeeklyReportRepository.mark_sent(session, refreshed, datetime.now(timezone.utc))
+        base_info["sent"] = int(base_info["sent"]) + 1
+        user_result["status"] = "sent"
+        cast_reports = base_info["reports"]
+        if isinstance(cast_reports, list):
+            cast_reports.append(user_result)
+
+    if int(base_info["failed"]) > 0:
+        base_info["ok"] = False
+        base_info["status"] = "failed"
+    elif int(base_info["sent"]) == 0 and int(base_info["skipped_empty"]) > 0:
+        base_info["status"] = "skipped_empty"
+    else:
+        base_info["status"] = "sent"
     base_info["message"] = (
-        f"{label.capitalize()} digest {report.id}: mail verstuurd ({start} → {end})"
+        f"{label.capitalize()} digest: {base_info['processed_users']} users, "
+        f"{base_info['sent']} sent, {base_info['skipped_empty']} skipped_empty, {base_info['failed']} failed."
     )
     return base_info

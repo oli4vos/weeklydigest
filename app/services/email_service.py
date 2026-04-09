@@ -44,6 +44,51 @@ class EmailService:
             smtp.send_message(msg)
         self.logger.info("Sent weekly report %s to %s", report.id, recipient)
 
+    def send_verification_code(
+        self,
+        *,
+        email_address: str,
+        code: str,
+        display_name: str | None = None,
+    ) -> None:
+        """Send a short email verification code used during Telegram onboarding."""
+        if not self.settings.smtp_host:
+            raise RuntimeError("SMTP_HOST is not configured")
+        if not email_address:
+            raise RuntimeError("Verification email address is required")
+
+        msg = EmailMessage()
+        msg["Subject"] = "Je verificatiecode voor Knowledge Inbox"
+        msg["From"] = self.settings.email_from or self.settings.smtp_username or "noreply@example.com"
+        msg["To"] = email_address
+        name = display_name or "gebruiker"
+        plain = (
+            f"Hoi {name},\n\n"
+            f"Je verificatiecode is: {code}\n\n"
+            "Deze code verloopt snel. Deel de code niet met anderen.\n"
+        )
+        msg.set_content(plain)
+        msg.add_alternative(
+            (
+                "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;line-height:1.5;color:#111;'>"
+                f"<p>Hoi {escape(name)},</p>"
+                "<p>Je verificatiecode is:</p>"
+                f"<p style='font-size:24px;font-weight:700;letter-spacing:3px;'>{escape(code)}</p>"
+                "<p>Deze code verloopt snel. Deel de code niet met anderen.</p>"
+                "</body></html>"
+            ),
+            subtype="html",
+        )
+        with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port) as smtp:
+            smtp.ehlo()
+            if self.settings.smtp_port not in (25, 2525) and self.settings.smtp_host not in {"localhost", "127.0.0.1"}:
+                smtp.starttls()
+                smtp.ehlo()
+            if self.settings.smtp_username and self.settings.smtp_password:
+                smtp.login(self.settings.smtp_username, self.settings.smtp_password)
+            smtp.send_message(msg)
+        self.logger.info("Sent onboarding verification email to user destination")
+
     def _render_html_body(self, report: WeeklyReport, plain_body: str) -> str:
         """Render a friendly HTML digest for Gmail/Apple Mail."""
         highlights = self._ensure_list(report.highlights_json)

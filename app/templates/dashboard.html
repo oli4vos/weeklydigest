@@ -22,6 +22,10 @@
 <div class="card">
   <h2>Status</h2>
   <p>
+    <strong>Users:</strong> {{ user_count }} totaal |
+    {{ digest_recipient_count }} digest-ready (email_verified)
+  </p>
+  <p>
     <strong>Laatste extraction:</strong>
     {% if latest_extraction %}
     {{ latest_extraction.extraction_status or "unknown" }} |
@@ -41,6 +45,43 @@
     nog geen digest run
     {% endif %}
   </p>
+</div>
+
+<div class="card">
+  <h2>Recente users</h2>
+  {% if recent_users %}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Telegram</th>
+        <th>Email</th>
+        <th>Status</th>
+        <th>Last seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for user in recent_users %}
+      <tr>
+        <td>{{ user.id }}</td>
+        <td>@{{ user.telegram_username or "-" }}</td>
+        <td>
+          {% if user.email %}
+          {{ user.email }}
+          {% if user.email_verified %}(verified){% else %}(pending){% endif %}
+          {% else %}
+          –
+          {% endif %}
+        </td>
+        <td>{{ user.onboarding_status or "new" }}</td>
+        <td>{% if user.last_seen_at %}{{ user.last_seen_at | dt_local }}{% else %}–{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>Er zijn nog geen users.</p>
+  {% endif %}
 </div>
 
 <div class="card">

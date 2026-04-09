@@ -1,33 +1,24 @@
-"""Database session and metadata helpers."""
+"""Additive migration for Telegram onboarding user fields."""
 from __future__ import annotations
 
-from contextlib import contextmanager
-import logging
-from typing import Iterator
+import sys
+from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy import inspect, text
 
-from .config import get_settings
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-Base = declarative_base()
-
-settings = get_settings()
-engine = create_engine(settings.database_url, echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
-
-# Import models so SQLAlchemy registers all tables on Base.metadata.
-from . import models as _models  # noqa: F401
-
-# Create any missing tables on app startup. No drop/reset.
-Base.metadata.create_all(bind=engine)
+from app.db import engine  # noqa: E402
 
 
-def _ensure_user_onboarding_columns() -> None:
-    """Add missing additive user columns for onboarding when upgrading existing DBs."""
+def main() -> None:
     inspector = inspect(engine)
     if "users" not in inspector.get_table_names():
+        print("users table not found; run init_db first.")
         return
+
     existing = {col["name"] for col in inspector.get_columns("users")}
     dialect = engine.dialect.name
     if dialect == "sqlite":
@@ -53,29 +44,19 @@ def _ensure_user_onboarding_columns() -> None:
             "UPDATE users SET onboarding_status = 'new' WHERE onboarding_status IS NULL OR onboarding_status = ''",
         ]
 
+    added: list[str] = []
     with engine.begin() as connection:
         for column_name, statement in additions.items():
             if column_name not in existing:
                 connection.execute(text(statement))
+                added.append(column_name)
         for statement in backfills:
             connection.execute(text(statement))
+    if added:
+        print(f"Added user columns: {', '.join(added)}")
+    else:
+        print("No schema changes needed; onboarding columns already present.")
 
 
-try:
-    _ensure_user_onboarding_columns()
-except Exception as exc:  # pragma: no cover
-    logging.getLogger(__name__).warning("Skipping onboarding column auto-migration: %s", exc)
-
-
-@contextmanager
-def get_session() -> Iterator[Session]:
-    """Provide a transactional scope around a series of operations."""
-    session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+if __name__ == "__main__":
+    main()

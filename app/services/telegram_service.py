@@ -1,29 +1,59 @@
-"""Telegram intake service that persists incoming text messages."""
+"""Telegram intake and onboarding service."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
-from datetime import datetime, timezone
+import secrets
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from telegram import Message, Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+import httpx
+from telegram import KeyboardButton, Message, ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from app.config import get_settings
 from app.db import get_session
-from app.models import RawMessage
+from app.models import RawMessage, User
 from app.repositories.user_repository import UserRepository
+from app.services.email_service import EmailService
 
 LINK_PATTERN = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+CODE_PATTERN = re.compile(r"^\d{6}$")
+
+STATUS_NEW = "new"
+STATUS_AWAITING_EMAIL = "awaiting_email"
+STATUS_AWAITING_EMAIL_VERIFICATION = "awaiting_email_verification"
+STATUS_ACTIVE = "active"
+STATUS_AWAITING_PHONE = "awaiting_phone"
+
+
+@dataclass
+class OutboundMessage:
+    text: str
+    ask_contact: bool = False
+
+
+@dataclass
+class ProcessingResult:
+    handled: bool
+    stored: bool
+    responses: list[OutboundMessage]
+    onboarding_status: str
 
 
 class TelegramService:
-    """Encapsulates polling logic and persistence for a Telegram bot."""
+    """Encapsulates polling/webhook intake, onboarding, and persistence."""
 
     def __init__(self, bot_token: str) -> None:
         if not bot_token:
             raise ValueError("Telegram bot token must be provided")
         self.bot_token = bot_token
+        self.settings = get_settings()
         self.logger = logging.getLogger(__name__)
+        self._verification_ttl = timedelta(minutes=self.settings.email_verification_code_ttl_minutes)
 
     def run(self) -> None:
         """Start the polling bot and block until it is stopped."""
@@ -33,56 +63,335 @@ class TelegramService:
 
     def _build_application(self) -> Application:
         application = Application.builder().token(self.bot_token).build()
+        application.add_handler(CommandHandler("start", self._handle_start))
+        application.add_handler(MessageHandler(filters.CONTACT, self._handle_contact))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self._handle_text_message))
         application.add_error_handler(self._handle_error)
         return application
+
+    async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if not message:
+            return
+        await self._handle_message_for_polling(message, text="/start")
+
+    async def _handle_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if not message:
+            return
+        await self._handle_message_for_polling(message)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.message
         if not message or not message.text:
             return
+        await self._handle_message_for_polling(message, text=message.text.strip())
 
-        text = message.text.strip()
-        if not text:
-            return
-
-        try:
-            self._store_message(message, text)
-        except Exception:  # pragma: no cover - defensive logging
-            self.logger.exception("Failed to persist Telegram message %s", getattr(message, "message_id", "?"))
-
-    def _store_message(self, message: Message, text: str) -> None:
+    async def _handle_message_for_polling(self, message: Message, *, text: Optional[str] = None) -> None:
         telegram_user = message.from_user
         if telegram_user is None:
-            self.logger.warning("Skipping message %s without Telegram user", getattr(message, "message_id", "?"))
             return
-
-        received_at = self._normalize_datetime(message.date)
-        contains_link = bool(LINK_PATTERN.search(text))
-        sender_name = self._format_sender_name(message)
-        telegram_user_id = str(telegram_user.id)
-        chat_id = str(message.chat_id)
-        username = telegram_user.username
-
-        self._persist_record(
-            telegram_user_id=telegram_user_id,
-            chat_id=chat_id,
-            username=username,
-            display_name=sender_name,
+        result = self._process_event(
+            telegram_user_id=str(telegram_user.id),
+            chat_id=str(message.chat_id),
+            username=telegram_user.username,
+            display_name=self._format_sender_name(message),
             external_message_id=str(message.message_id),
-            text=text,
-            received_at=received_at,
-            contains_link=contains_link,
+            text=text if text is not None else (message.text or "").strip() or None,
+            contact_phone=(message.contact.phone_number if message.contact else None),
+            contact_user_id=(str(message.contact.user_id) if message.contact and message.contact.user_id else None),
+            received_at=self._normalize_datetime(message.date),
         )
-        self.logger.info(
-            "Stored Telegram message id=%s chat=%s contains_link=%s",
-            message.message_id,
-            message.chat_id,
-            contains_link,
-        )
+        for outbound in result.responses:
+            kwargs = {}
+            if outbound.ask_contact:
+                kwargs["reply_markup"] = ReplyKeyboardMarkup(
+                    [[KeyboardButton("Deel telefoonnummer (optioneel)", request_contact=True)]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True,
+                )
+            await message.reply_text(outbound.text, **kwargs)
 
     async def _handle_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.exception("Telegram polling error: %s", context.error)
+
+    def _process_event(
+        self,
+        *,
+        telegram_user_id: str,
+        chat_id: str,
+        username: Optional[str],
+        display_name: Optional[str],
+        external_message_id: Optional[str],
+        text: Optional[str],
+        contact_phone: Optional[str],
+        contact_user_id: Optional[str],
+        received_at: datetime,
+    ) -> ProcessingResult:
+        responses: list[OutboundMessage] = []
+        stored = False
+        with get_session() as session:
+            user = UserRepository.find_or_create_from_telegram(
+                session=session,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                username=username,
+                display_name=display_name,
+            )
+            user.last_seen_at = received_at
+            if not user.onboarding_status:
+                user.onboarding_status = STATUS_NEW
+
+            if contact_phone:
+                responses.extend(self._handle_contact_share(user, contact_phone, contact_user_id, telegram_user_id))
+                return ProcessingResult(True, stored, responses, user.onboarding_status)
+
+            normalized_text = (text or "").strip()
+            if not normalized_text:
+                return ProcessingResult(False, stored, responses, user.onboarding_status)
+
+            lowered = normalized_text.lower()
+            if lowered == "/start":
+                responses.extend(self._handle_start_command(user))
+                return ProcessingResult(True, stored, responses, user.onboarding_status)
+
+            if lowered.startswith("/") and lowered != "/start":
+                responses.append(
+                    OutboundMessage(
+                        "Ik ken dit commando nog niet. Gebruik /start om onboarding te vervolgen."
+                    )
+                )
+                return ProcessingResult(True, stored, responses, user.onboarding_status)
+
+            if not user.email_verified:
+                handled, pre_verified_stored, onboarding_responses = self._handle_pre_verification_text(
+                    session=session,
+                    user=user,
+                    text=normalized_text,
+                    chat_id=chat_id,
+                    display_name=display_name,
+                    external_message_id=external_message_id,
+                    received_at=received_at,
+                )
+                responses.extend(onboarding_responses)
+                if handled:
+                    return ProcessingResult(True, pre_verified_stored, responses, user.onboarding_status)
+                return ProcessingResult(False, pre_verified_stored, responses, user.onboarding_status)
+
+            user.onboarding_status = STATUS_ACTIVE
+            stored = self._store_raw_message(
+                session=session,
+                user=user,
+                chat_id=chat_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                text=normalized_text,
+                received_at=received_at,
+            )
+        return ProcessingResult(True, stored, responses, STATUS_ACTIVE)
+
+    def _handle_start_command(self, user: User) -> list[OutboundMessage]:
+        responses: list[OutboundMessage] = []
+        first_name = (user.display_name or "daar").split(" ")[0]
+        if user.email_verified:
+            user.onboarding_status = STATUS_ACTIVE
+            responses.append(
+                OutboundMessage(
+                    f"Welkom terug {first_name}. Je account is actief; ik sla je berichten op voor je digest."
+                )
+            )
+            if not user.phone_verified:
+                responses.append(
+                    OutboundMessage(
+                        "Wil je optioneel je telefoonnummer delen voor profielcompleetheid?",
+                        ask_contact=True,
+                    )
+                )
+            return responses
+
+        if not user.email:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            responses.append(
+                OutboundMessage(
+                    "Welkom! Stuur je e-mailadres zodat ik je daily/weekly digest kan sturen."
+                )
+            )
+        else:
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            responses.append(
+                OutboundMessage(
+                    "Je e-mailadres staat al ingevuld. Stuur de 6-cijferige verificatiecode uit je mail (of typ 'resend')."
+                )
+            )
+        responses.append(
+            OutboundMessage(
+                "Optioneel: deel je telefoonnummer via de knop hieronder.",
+                ask_contact=True,
+            )
+        )
+        return responses
+
+    def _handle_pre_verification_text(
+        self,
+        *,
+        session,
+        user: User,
+        text: str,
+        chat_id: str,
+        display_name: Optional[str],
+        external_message_id: Optional[str],
+        received_at: datetime,
+    ) -> tuple[bool, bool, list[OutboundMessage]]:
+        responses: list[OutboundMessage] = []
+        lowered = text.lower()
+        if EMAIL_PATTERN.match(text):
+            user.email = text.strip().lower()
+            user.email_verified = False
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            self._issue_and_send_verification_code(user, responses)
+            return True, False, responses
+
+        if CODE_PATTERN.match(text) and user.onboarding_status == STATUS_AWAITING_EMAIL_VERIFICATION:
+            if self._verify_code(user, text):
+                user.email_verified = True
+                user.onboarding_status = STATUS_ACTIVE
+                user.email_verification_token_hash = None
+                user.email_verification_sent_at = None
+                responses.append(
+                    OutboundMessage("Top, je e-mailadres is geverifieerd. Vanaf nu ontvang je je eigen digests.")
+                )
+                if not user.phone_verified:
+                    responses.append(
+                        OutboundMessage("Optioneel: deel je telefoonnummer via de knop.", ask_contact=True)
+                    )
+            else:
+                responses.append(
+                    OutboundMessage(
+                        "Ongeldige of verlopen code. Typ 'resend' voor een nieuwe verificatiecode."
+                    )
+                )
+            return True, False, responses
+
+        if lowered in {"resend", "opnieuw", "stuur code", "nieuw code"}:
+            if not user.email:
+                user.onboarding_status = STATUS_AWAITING_EMAIL
+                responses.append(OutboundMessage("Stuur eerst je e-mailadres."))
+                return True, False, responses
+            user.email_verified = False
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            self._issue_and_send_verification_code(user, responses)
+            return True, False, responses
+
+        # Store regular content messages even before verification.
+        stored = self._store_raw_message(
+            session=session,
+            user=user,
+            chat_id=chat_id,
+            display_name=display_name,
+            external_message_id=external_message_id,
+            text=text,
+            received_at=received_at,
+        )
+        if not user.email:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            responses.append(
+                OutboundMessage(
+                    "Bericht opgeslagen. Rond onboarding af door je e-mailadres te sturen."
+                )
+            )
+        else:
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            responses.append(
+                OutboundMessage(
+                    "Bericht opgeslagen. Verifieer je e-mail met de 6-cijferige code (of typ 'resend')."
+                )
+            )
+        return True, stored, responses
+
+    def _handle_contact_share(
+        self,
+        user: User,
+        contact_phone: str,
+        contact_user_id: Optional[str],
+        telegram_user_id: str,
+    ) -> list[OutboundMessage]:
+        responses: list[OutboundMessage] = []
+        if contact_user_id and contact_user_id != telegram_user_id:
+            responses.append(
+                OutboundMessage("Deel alsjeblieft je eigen contactkaart; dit nummer is niet geverifieerd.")
+            )
+            return responses
+        user.phone_number = contact_phone
+        user.phone_verified = True
+        if user.email_verified:
+            user.onboarding_status = STATUS_ACTIVE
+        elif user.onboarding_status == STATUS_NEW:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+        responses.append(OutboundMessage("Dank, je telefoonnummer is opgeslagen (optioneel veld)."))
+        return responses
+
+    def _issue_and_send_verification_code(self, user: User, responses: list[OutboundMessage]) -> None:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        user.email_verification_token_hash = self._hash_code(user.id, code)
+        user.email_verification_sent_at = datetime.now(timezone.utc)
+        try:
+            EmailService(settings=self.settings).send_verification_code(
+                email_address=user.email or "",
+                code=code,
+                display_name=user.display_name,
+            )
+            responses.append(
+                OutboundMessage("Ik heb een 6-cijferige verificatiecode gemaild. Stuur die code hier terug.")
+            )
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("Failed to send verification email for user %s: %s", user.id, exc)
+            responses.append(
+                OutboundMessage(
+                    "Ik kon de verificatiecode nu niet mailen. Typ 'resend' om het opnieuw te proberen."
+                )
+            )
+
+    def _verify_code(self, user: User, provided_code: str) -> bool:
+        if not user.email_verification_token_hash or not user.email_verification_sent_at:
+            return False
+        sent_at = self._normalize_datetime(user.email_verification_sent_at)
+        if datetime.now(timezone.utc) > sent_at + self._verification_ttl:
+            return False
+        expected = self._hash_code(user.id, provided_code)
+        return secrets.compare_digest(expected, user.email_verification_token_hash)
+
+    @staticmethod
+    def _hash_code(user_id: int, code: str) -> str:
+        digest = hashlib.sha256(f"{user_id}:{code}".encode("utf-8"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _store_raw_message(
+        *,
+        session,
+        user: User,
+        chat_id: str,
+        display_name: Optional[str],
+        external_message_id: Optional[str],
+        text: str,
+        received_at: datetime,
+    ) -> bool:
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return False
+        contains_link = bool(LINK_PATTERN.search(clean_text))
+        raw_message = RawMessage(
+            user_id=user.id,
+            source="telegram",
+            external_message_id=external_message_id or None,
+            chat_id=chat_id,
+            sender_name=display_name,
+            text=clean_text,
+            received_at=received_at,
+            contains_link=contains_link,
+        )
+        session.add(raw_message)
+        return True
 
     @staticmethod
     def _normalize_datetime(value: Optional[datetime]) -> datetime:
@@ -108,13 +417,10 @@ class TelegramService:
 
     @classmethod
     def store_from_payload(cls, payload: dict) -> bool:
-        """Persist a Telegram update received via webhook."""
+        """Persist and respond to a Telegram update received via webhook."""
+        settings = get_settings()
         message = payload.get("message") or payload.get("edited_message")
         if not message:
-            return False
-
-        text = (message.get("text") or "").strip()
-        if not text:
             return False
 
         from_user = message.get("from") or {}
@@ -125,57 +431,47 @@ class TelegramService:
             logging.getLogger(__name__).warning("Webhook payload missing user/chat identifiers")
             return False
 
-        sender_name = cls._format_sender_name_from_dict(from_user)
-        username = from_user.get("username")
-        contains_link = bool(LINK_PATTERN.search(text))
-        timestamp = message.get("date")
-        received_at = cls._normalize_datetime(cls._from_timestamp(timestamp))
-        cls._persist_record(
+        text = (message.get("text") or "").strip() or None
+        contact = message.get("contact") or {}
+        contact_phone = contact.get("phone_number")
+        contact_user_id = str(contact.get("user_id")) if contact.get("user_id") is not None else None
+        service = cls(bot_token=settings.telegram_bot_token or "")
+        result = service._process_event(
             telegram_user_id=str(telegram_user_id),
             chat_id=str(chat_id),
-            username=username,
-            display_name=sender_name,
+            username=from_user.get("username"),
+            display_name=cls._format_sender_name_from_dict(from_user),
             external_message_id=str(message.get("message_id") or ""),
             text=text,
-            received_at=received_at,
-            contains_link=contains_link,
+            contact_phone=contact_phone,
+            contact_user_id=contact_user_id,
+            received_at=cls._normalize_datetime(cls._from_timestamp(message.get("date"))),
         )
-        return True
+        if result.responses:
+            service._send_webhook_responses(chat_id=str(chat_id), responses=result.responses)
+        return result.handled
 
-    @staticmethod
-    def _persist_record(
-        *,
-        telegram_user_id: str,
-        chat_id: str,
-        username: Optional[str],
-        display_name: Optional[str],
-        external_message_id: str,
-        text: str,
-        received_at: datetime,
-        contains_link: bool,
-    ) -> None:
-        """Shared persistence helper for polling + webhook flows."""
-        logger = logging.getLogger(__name__)
-        with get_session() as session:
-            user = UserRepository.find_or_create_from_telegram(
-                session=session,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                username=username,
-                display_name=display_name,
-            )
-            raw_message = RawMessage(
-                user_id=user.id,
-                source="telegram",
-                external_message_id=external_message_id or None,
-                chat_id=chat_id,
-                sender_name=display_name,
-                text=text,
-                received_at=received_at,
-                contains_link=contains_link,
-            )
-            session.add(raw_message)
-        logger.info("Stored Telegram webhook message chat=%s contains_link=%s", chat_id, contains_link)
+    def _send_webhook_responses(self, *, chat_id: str, responses: list[OutboundMessage]) -> None:
+        if not self.bot_token:
+            return
+        api_base = f"https://api.telegram.org/bot{self.bot_token}"
+        timeout = httpx.Timeout(10.0)
+        with httpx.Client(timeout=timeout) as client:
+            for outbound in responses:
+                payload: dict[str, object] = {
+                    "chat_id": chat_id,
+                    "text": outbound.text,
+                }
+                if outbound.ask_contact:
+                    payload["reply_markup"] = {
+                        "keyboard": [[{"text": "Deel telefoonnummer (optioneel)", "request_contact": True}]],
+                        "resize_keyboard": True,
+                        "one_time_keyboard": True,
+                    }
+                try:
+                    client.post(f"{api_base}/sendMessage", json=payload)
+                except Exception:  # pragma: no cover
+                    self.logger.exception("Failed to send Telegram response to chat %s", chat_id)
 
     @staticmethod
     def _from_timestamp(timestamp: Optional[int]) -> datetime:

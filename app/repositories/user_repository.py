@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app.models import User
@@ -16,6 +16,38 @@ class UserRepository:
     def find_by_telegram_user_id(session: Session, telegram_user_id: str) -> Optional[User]:
         stmt: Select[User] = select(User).where(User.telegram_user_id == telegram_user_id)
         return session.execute(stmt).scalar_one_or_none()
+
+    @staticmethod
+    def find_by_id(session: Session, user_id: int) -> Optional[User]:
+        return session.get(User, user_id)
+
+    @staticmethod
+    def list_digest_recipients(session: Session) -> list[User]:
+        stmt: Select[User] = (
+            select(User)
+            .where(
+                User.is_active.is_(True),
+                User.email_verified.is_(True),
+                User.email.is_not(None),
+                User.email != "",
+            )
+            .order_by(User.id.asc())
+        )
+        return session.execute(stmt).scalars().all()
+
+    @staticmethod
+    def list_recent(session: Session, limit: int = 10) -> list[User]:
+        stmt: Select[User] = (
+            select(User)
+            .order_by(func.coalesce(User.last_seen_at, User.created_at).desc(), User.id.desc())
+            .limit(limit)
+        )
+        return session.execute(stmt).scalars().all()
+
+    @staticmethod
+    def count_all(session: Session) -> int:
+        stmt = select(func.count(User.id))
+        return int(session.execute(stmt).scalar_one())
 
     @staticmethod
     def find_or_create_from_telegram(
