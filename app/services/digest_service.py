@@ -10,9 +10,12 @@ from textwrap import shorten
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from app.config import get_settings
 from app.db import get_session
 from app.models import RawMessage, Resource, WeeklyReport
 from app.repositories.weekly_report_repository import WeeklyReportRepository
+from app.schemas import AIDigestPayload
+from app.services.ai_digest_service import AIDigestService, is_ai_enabled
 from app.utils.datetime_utils import format_datetime_for_display
 
 
@@ -43,7 +46,14 @@ class DigestService:
             resources = self._load_resources(session, user_id, start, end)
             previous = WeeklyReportRepository.latest_for_user(session, user_id)
 
-            report_data = self._build_payload(messages, resources, previous, start, end)
+            report_data = self._build_payload(
+                user_id=user_id,
+                messages=messages,
+                resources=resources,
+                previous=previous,
+                start=start,
+                end=end,
+            )
             report = WeeklyReportRepository.create(
                 session,
                 user_id=user_id,
@@ -94,6 +104,8 @@ class DigestService:
 
     def _build_payload(
         self,
+        *,
+        user_id: int,
         messages: List[RawMessage],
         resources: List[Resource],
         previous: Optional[WeeklyReport],
@@ -120,6 +132,61 @@ class DigestService:
         reflection = self._build_reflection(message_count, len(external_resources), note_count, themes, links_overview)
         meta_analysis = self._build_meta_analysis(previous, message_count, resource_count)
         intro_summary = self._intro_summary(message_count, len(external_resources), note_count)
+
+        settings = get_settings()
+        ai_payload: Optional[AIDigestPayload] = None
+        ai_meta: Dict[str, object] = {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "OPENAI_DIGEST_ENABLED is false or OPENAI_API_KEY missing",
+            "model": settings.openai_digest_model,
+            "call_made": False,
+            "tokens_total": 0,
+        }
+        if is_ai_enabled(settings):
+            try:
+                ai_result = AIDigestService().enhance(
+                    user_id=user_id,
+                    start=start,
+                    end=end,
+                    message_count=message_count,
+                    resource_count=resource_count,
+                    duplicates_filtered_count=duplicates_filtered_count,
+                    notes=ideas,
+                    resources=external_resources,
+                    highlights=highlights,
+                    themes=themes,
+                    actions=actions,
+                    reflection=reflection,
+                    meta_analysis=meta_analysis,
+                )
+                ai_payload = ai_result.payload
+                ai_meta = ai_result.meta
+            except Exception as exc:  # pragma: no cover
+                self.logger.warning("AI digest enhancement failed hard, fallback to heuristic digest: %s", exc)
+                ai_meta = {
+                    "enabled": True,
+                    "status": "failed_fallback",
+                    "reason": str(exc),
+                    "model": settings.openai_digest_model,
+                    "call_made": True,
+                    "tokens_total": 0,
+                }
+        else:
+            self.logger.info("AI digest enhancement skipped: disabled or missing OPENAI_API_KEY")
+
+        themes["ai_enhancement"] = ai_meta
+        if ai_payload:
+            intro_summary, highlights, themes, ideas, actions, reflection, meta_analysis = self._apply_ai_enhancement(
+                ai_payload,
+                intro_summary=intro_summary,
+                highlights=highlights,
+                themes=themes,
+                ideas=ideas,
+                actions=actions,
+                reflection=reflection,
+                meta_analysis=meta_analysis,
+            )
 
         subject = f"Weekly Digest {start:%Y-%m-%d} - {end:%Y-%m-%d}"
         body = self._render_email_body(
@@ -149,6 +216,48 @@ class DigestService:
             "status": "generated",
             "generated_at": datetime.now(timezone.utc),
         }
+
+    def _apply_ai_enhancement(
+        self,
+        ai_payload: AIDigestPayload,
+        *,
+        intro_summary: str,
+        highlights: List[Dict],
+        themes: Dict,
+        ideas: List[Dict],
+        actions: List[str],
+        reflection: str,
+        meta_analysis: str,
+    ) -> Tuple[str, List[Dict], Dict, List[Dict], List[str], str, str]:
+        intro = ai_payload.summary.strip() or intro_summary
+        merged_highlights = self._map_ai_highlights(ai_payload, fallback=highlights)
+        if ai_payload.themes:
+            themes["story"] = " ".join(ai_payload.themes[:2]).strip()
+        if ai_payload.key_insight:
+            themes["platform_story"] = ai_payload.key_insight.strip()
+        if ai_payload.ideas:
+            ideas = [{"received_at": "", "text": item} for item in ai_payload.ideas]
+        if ai_payload.actions:
+            actions = ai_payload.actions
+        reflection = ai_payload.reflection.strip() or reflection
+        meta_analysis = ai_payload.meta_analysis.strip() or meta_analysis
+        return intro, merged_highlights, themes, ideas, actions, reflection, meta_analysis
+
+    def _map_ai_highlights(self, ai_payload: AIDigestPayload, *, fallback: List[Dict]) -> List[Dict]:
+        mapped: List[Dict] = []
+        for highlight in ai_payload.highlights[:5]:
+            title = highlight.title.strip()
+            if not title:
+                continue
+            mapped.append(
+                {
+                    "type": "resource",
+                    "title": title,
+                    "detail": "AI highlight",
+                    "why_relevant": highlight.why_relevant.strip(),
+                }
+            )
+        return mapped or fallback
 
     def _build_highlights(self, resources: List[Resource], ideas: List[Dict]) -> Tuple[List[Dict], int]:
         highlights: List[Dict] = []

@@ -172,6 +172,18 @@ Gebruik `--dry-run` om alleen te genereren en de e-mailtekst te printen zonder t
 
 Rapporten blijven historisch opgeslagen; er zijn statusvelden (`generated`, `sent`) plus `generated_at`/`sent_at`. Hierdoor kun je lokaal meerdere weken aanmaken en later automatiseren.
 
+### Optionele AI digest enhancement
+- De deterministische pipeline blijft leidend.
+- Na heuristische digest-opbouw kan optioneel één OpenAI-call de formulering aanscherpen.
+- Nieuwe variabelen:
+  - `OPENAI_DIGEST_ENABLED=true|false` (default: `false`)
+  - `OPENAI_DIGEST_MODEL=gpt-4o-mini`
+  - `OPENAI_DIGEST_MAX_INPUT_TOKENS=6000`
+  - `OPENAI_DIGEST_MAX_OUTPUT_TOKENS=1000`
+  - `OPENAI_DAILY_TOKEN_LIMIT=50000`
+  - `OPENAI_DAILY_CALL_LIMIT=5`
+- Bij API-fouten of limietbereik valt het systeem automatisch terug op de bestaande heuristische digest zonder crash.
+
 ### Automatische runs (launchd)
 Op macOS kun je de scripts automatisch laten draaien via `launchd`. In deze repo staan twee shell-scripts:
 

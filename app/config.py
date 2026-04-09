@@ -22,6 +22,14 @@ def _default_database_url() -> str:
     return f"sqlite:///{DEFAULT_DB_PATH}"  # absolute path ensures predictable location
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse common truthy env values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Typed view over the runtime configuration."""
@@ -30,6 +38,12 @@ class Settings:
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+    openai_digest_enabled: bool = _env_bool("OPENAI_DIGEST_ENABLED", False)
+    openai_digest_model: str = os.getenv("OPENAI_DIGEST_MODEL", "gpt-4o-mini")
+    openai_digest_max_input_tokens: int = int(os.getenv("OPENAI_DIGEST_MAX_INPUT_TOKENS", "6000"))
+    openai_digest_max_output_tokens: int = int(os.getenv("OPENAI_DIGEST_MAX_OUTPUT_TOKENS", "1000"))
+    openai_daily_token_limit: int = int(os.getenv("OPENAI_DAILY_TOKEN_LIMIT", "50000"))
+    openai_daily_call_limit: int = int(os.getenv("OPENAI_DAILY_CALL_LIMIT", "5"))
     smtp_host: Optional[str] = os.getenv("SMTP_HOST")
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
     smtp_username: Optional[str] = os.getenv("SMTP_USERNAME")

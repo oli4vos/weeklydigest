@@ -164,3 +164,29 @@ class EnrichmentPayload(BaseModel):
             self.insights = self.insights[:5]
         if len(self.tags) > 6:
             self.tags = self.tags[:6]
+
+
+class AIDigestHighlight(BaseModel):
+    """Single AI-selected highlight with explicit relevance explanation."""
+
+    title: str
+    why_relevant: str
+
+
+class AIDigestPayload(BaseModel):
+    """Validated structured output for AI-enhanced digest rendering."""
+
+    summary: str
+    key_insight: str
+    highlights: List[AIDigestHighlight]
+    themes: List[str]
+    ideas: List[str]
+    actions: List[str]
+    reflection: str
+    meta_analysis: str
+
+    def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
+        self.highlights = self.highlights[:5]
+        self.themes = [item.strip() for item in self.themes if item and item.strip()][:5]
+        self.ideas = [item.strip() for item in self.ideas if item and item.strip()][:8]
+        self.actions = [item.strip() for item in self.actions if item and item.strip()][:3]
