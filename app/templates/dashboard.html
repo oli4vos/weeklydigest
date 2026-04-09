@@ -20,6 +20,79 @@
 </div>
 
 <div class="card">
+  <h2>Status</h2>
+  <p>
+    <strong>Laatste extraction:</strong>
+    {% if latest_extraction %}
+    {{ latest_extraction.extraction_status or "unknown" }} |
+    {{ extraction_total }} recente resources geanalyseerd
+    ({{ extraction_counts.success }} success, {{ extraction_counts.partial }} partial, {{ extraction_counts.failed }} failed)
+    {% else %}
+    nog geen extraction data
+    {% endif %}
+  </p>
+  <p>
+    <strong>Laatste digest:</strong>
+    {% if latest_digest %}
+    {{ latest_digest.status or "generated" }} | report #{{ latest_digest.id }}
+    {% if latest_digest.sent_at %}| verzonden {{ latest_digest.sent_at }}{% endif %}
+    {% else %}
+    nog geen digest run
+    {% endif %}
+  </p>
+</div>
+
+<div class="card">
+  <h2>Nieuwe input</h2>
+  {% if recent_messages %}
+  <table>
+    <thead>
+      <tr>
+        <th>Tijdstip</th>
+        <th>Tekst</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for msg in recent_messages %}
+      <tr>
+        <td>{{ msg.received_at }}</td>
+        <td>{{ (msg.text or "")[:120] }}{% if (msg.text or "")|length > 120 %}...{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>Er zijn nog geen berichten.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Recente resources</h2>
+  {% if recent_resources %}
+  <table>
+    <thead>
+      <tr>
+        <th>URL</th>
+        <th>Platform</th>
+        <th>Extraction status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for resource in recent_resources %}
+      <tr>
+        <td>{{ (resource.url or "")[:80] }}{% if (resource.url or "")|length > 80 %}...{% endif %}</td>
+        <td>{{ resource.platform or "unknown" }}</td>
+        <td>{{ resource.extraction_status or "pending" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>Er zijn nog geen resources.</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Laatste rapporten</h2>
   {% if reports %}
   <table>
