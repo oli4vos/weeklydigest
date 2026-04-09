@@ -58,6 +58,7 @@ python scripts/migrate_user_onboarding.py
    python scripts/run_bot.py
    ```
 5. Stuur `/start` naar je bot om onboarding te starten (e-mail invoeren + code verifiëren).
+   - Bij een foute of verlopen code kun je altijd `/resend` sturen.
 6. Na onboarding worden tekstberichten opgeslagen in `raw_messages` met `source='telegram'`. Links worden gedetecteerd via regex en gemarkeerd in `contains_link`.
 
 ### Multi-user basis

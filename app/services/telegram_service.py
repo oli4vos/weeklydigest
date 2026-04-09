@@ -64,6 +64,7 @@ class TelegramService:
     def _build_application(self) -> Application:
         application = Application.builder().token(self.bot_token).build()
         application.add_handler(CommandHandler("start", self._handle_start))
+        application.add_handler(CommandHandler("resend", self._handle_resend))
         application.add_handler(MessageHandler(filters.CONTACT, self._handle_contact))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self._handle_text_message))
         application.add_error_handler(self._handle_error)
@@ -80,6 +81,12 @@ class TelegramService:
         if not message:
             return
         await self._handle_message_for_polling(message)
+
+    async def _handle_resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if not message:
+            return
+        await self._handle_message_for_polling(message, text="/resend")
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.message
@@ -154,11 +161,14 @@ class TelegramService:
             if lowered == "/start":
                 responses.extend(self._handle_start_command(user))
                 return ProcessingResult(True, stored, responses, user.onboarding_status)
+            if lowered.startswith("/resend"):
+                responses.extend(self._handle_resend_command(user))
+                return ProcessingResult(True, stored, responses, user.onboarding_status)
 
             if lowered.startswith("/") and lowered != "/start":
                 responses.append(
                     OutboundMessage(
-                        "Ik ken dit commando nog niet. Gebruik /start om onboarding te vervolgen."
+                        "Onbekend commando. Gebruik /start om onboarding te zien of /resend voor een nieuwe verificatiecode."
                     )
                 )
                 return ProcessingResult(True, stored, responses, user.onboarding_status)
@@ -197,38 +207,60 @@ class TelegramService:
             user.onboarding_status = STATUS_ACTIVE
             responses.append(
                 OutboundMessage(
-                    f"Welkom terug {first_name}. Je account is actief; ik sla je berichten op voor je digest."
+                    f"Welkom terug {first_name}! Je account is actief. Stuur gerust berichten; ik neem ze mee in je digest."
                 )
             )
             if not user.phone_verified:
                 responses.append(
                     OutboundMessage(
-                        "Wil je optioneel je telefoonnummer delen voor profielcompleetheid?",
+                        "Wil je optioneel je telefoonnummer delen voor je profiel?",
                         ask_contact=True,
                     )
                 )
             return responses
 
-        if not user.email:
+        if user.onboarding_status in {STATUS_NEW, STATUS_AWAITING_EMAIL} or not user.email:
             user.onboarding_status = STATUS_AWAITING_EMAIL
             responses.append(
                 OutboundMessage(
-                    "Welkom! Stuur je e-mailadres zodat ik je daily/weekly digest kan sturen."
+                    "Welkom! 👋\nIk help je met een persoonlijke digest.\nStuur eerst je e-mailadres, dan activeer ik je account."
                 )
             )
-        else:
+            responses.append(
+                OutboundMessage(
+                    "Na verificatie ontvang je je eigen daily/weekly digest. Je berichten worden nu al opgeslagen."
+                )
+            )
+        elif user.onboarding_status in {STATUS_AWAITING_EMAIL_VERIFICATION, STATUS_AWAITING_PHONE}:
             user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
             responses.append(
                 OutboundMessage(
-                    "Je e-mailadres staat al ingevuld. Stuur de 6-cijferige verificatiecode uit je mail (of typ 'resend')."
+                    f"Je e-mailadres ({self._mask_email(user.email)}) staat al klaar.\n"
+                    "Stuur de 6-cijferige verificatiecode uit je mail, of gebruik /resend."
                 )
             )
+        else:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            responses.append(OutboundMessage("Stuur je e-mailadres om onboarding af te ronden."))
         responses.append(
             OutboundMessage(
                 "Optioneel: deel je telefoonnummer via de knop hieronder.",
                 ask_contact=True,
             )
         )
+        return responses
+
+    def _handle_resend_command(self, user: User) -> list[OutboundMessage]:
+        responses: list[OutboundMessage] = []
+        if not user.email:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            responses.append(
+                OutboundMessage("Ik heb nog geen e-mailadres. Stuur eerst je e-mailadres.")
+            )
+            return responses
+        user.email_verified = False
+        user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+        self._issue_and_send_verification_code(user, responses)
         return responses
 
     def _handle_pre_verification_text(
@@ -248,38 +280,63 @@ class TelegramService:
             user.email = text.strip().lower()
             user.email_verified = False
             user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            responses.append(
+                OutboundMessage(
+                    f"Top, e-mailadres ontvangen: {self._mask_email(user.email)}."
+                )
+            )
             self._issue_and_send_verification_code(user, responses)
             return True, False, responses
 
         if CODE_PATTERN.match(text) and user.onboarding_status == STATUS_AWAITING_EMAIL_VERIFICATION:
-            if self._verify_code(user, text):
+            verification_state = self._verify_code(user, text)
+            if verification_state == "ok":
                 user.email_verified = True
                 user.onboarding_status = STATUS_ACTIVE
                 user.email_verification_token_hash = None
                 user.email_verification_sent_at = None
                 responses.append(
-                    OutboundMessage("Top, je e-mailadres is geverifieerd. Vanaf nu ontvang je je eigen digests.")
+                    OutboundMessage("✅ Code klopt. Je e-mailadres is geverifieerd.")
+                )
+                responses.append(
+                    OutboundMessage("Je account is nu actief. Nieuwe berichten worden automatisch verwerkt voor je digest.")
                 )
                 if not user.phone_verified:
                     responses.append(
                         OutboundMessage("Optioneel: deel je telefoonnummer via de knop.", ask_contact=True)
                     )
+            elif verification_state == "expired":
+                responses.append(
+                    OutboundMessage(
+                        "⏳ Deze code is verlopen. Gebruik /resend voor een nieuwe code."
+                    )
+                )
             else:
                 responses.append(
                     OutboundMessage(
-                        "Ongeldige of verlopen code. Typ 'resend' voor een nieuwe verificatiecode."
+                        "❌ Die code klopt niet. Controleer de 6 cijfers of gebruik /resend."
                     )
                 )
             return True, False, responses
 
-        if lowered in {"resend", "opnieuw", "stuur code", "nieuw code"}:
-            if not user.email:
-                user.onboarding_status = STATUS_AWAITING_EMAIL
-                responses.append(OutboundMessage("Stuur eerst je e-mailadres."))
-                return True, False, responses
-            user.email_verified = False
-            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
-            self._issue_and_send_verification_code(user, responses)
+        if lowered in {"resend", "opnieuw", "stuur code", "nieuw code", "/resend"}:
+            responses.extend(self._handle_resend_command(user))
+            return True, False, responses
+
+        if user.onboarding_status == STATUS_AWAITING_EMAIL and ("@" in text or "mail" in lowered):
+            responses.append(
+                OutboundMessage(
+                    "Dat lijkt geen geldig e-mailadres. Gebruik bijvoorbeeld naam@domein.nl."
+                )
+            )
+            return True, False, responses
+
+        if CODE_PATTERN.match(text) and user.onboarding_status != STATUS_AWAITING_EMAIL_VERIFICATION:
+            responses.append(
+                OutboundMessage(
+                    "Ik verwacht nu eerst je e-mailadres. Daarna kun je de verificatiecode invoeren."
+                )
+            )
             return True, False, responses
 
         # Store regular content messages even before verification.
@@ -303,7 +360,7 @@ class TelegramService:
             user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
             responses.append(
                 OutboundMessage(
-                    "Bericht opgeslagen. Verifieer je e-mail met de 6-cijferige code (of typ 'resend')."
+                    "Bericht opgeslagen. Verifieer je e-mail met de 6-cijferige code of gebruik /resend."
                 )
             )
         return True, stored, responses
@@ -318,7 +375,7 @@ class TelegramService:
         responses: list[OutboundMessage] = []
         if contact_user_id and contact_user_id != telegram_user_id:
             responses.append(
-                OutboundMessage("Deel alsjeblieft je eigen contactkaart; dit nummer is niet geverifieerd.")
+                OutboundMessage("Gebruik je eigen contactkaart; dit nummer kan ik nu niet verifiëren.")
             )
             return responses
         user.phone_number = contact_phone
@@ -327,7 +384,7 @@ class TelegramService:
             user.onboarding_status = STATUS_ACTIVE
         elif user.onboarding_status == STATUS_NEW:
             user.onboarding_status = STATUS_AWAITING_EMAIL
-        responses.append(OutboundMessage("Dank, je telefoonnummer is opgeslagen (optioneel veld)."))
+        responses.append(OutboundMessage("Dank! Je telefoonnummer is opgeslagen als optioneel profielveld."))
         return responses
 
     def _issue_and_send_verification_code(self, user: User, responses: list[OutboundMessage]) -> None:
@@ -341,29 +398,45 @@ class TelegramService:
                 display_name=user.display_name,
             )
             responses.append(
-                OutboundMessage("Ik heb een 6-cijferige verificatiecode gemaild. Stuur die code hier terug.")
+                OutboundMessage(
+                    "📩 Verificatiecode verstuurd. Stuur hier de 6 cijfers terug. Oude codes zijn nu ongeldig."
+                )
             )
         except Exception as exc:  # pragma: no cover
             self.logger.exception("Failed to send verification email for user %s: %s", user.id, exc)
             responses.append(
                 OutboundMessage(
-                    "Ik kon de verificatiecode nu niet mailen. Typ 'resend' om het opnieuw te proberen."
+                    "Ik kon nu geen verificatiecode mailen. Probeer straks opnieuw met /resend."
                 )
             )
 
-    def _verify_code(self, user: User, provided_code: str) -> bool:
+    def _verify_code(self, user: User, provided_code: str) -> str:
         if not user.email_verification_token_hash or not user.email_verification_sent_at:
-            return False
+            return "missing"
         sent_at = self._normalize_datetime(user.email_verification_sent_at)
         if datetime.now(timezone.utc) > sent_at + self._verification_ttl:
-            return False
+            return "expired"
         expected = self._hash_code(user.id, provided_code)
-        return secrets.compare_digest(expected, user.email_verification_token_hash)
+        if secrets.compare_digest(expected, user.email_verification_token_hash):
+            return "ok"
+        return "invalid"
 
     @staticmethod
     def _hash_code(user_id: int, code: str) -> str:
         digest = hashlib.sha256(f"{user_id}:{code}".encode("utf-8"))
         return digest.hexdigest()
+
+    @staticmethod
+    def _mask_email(email: Optional[str]) -> str:
+        value = (email or "").strip()
+        if not value or "@" not in value:
+            return "onbekend e-mailadres"
+        local, domain = value.split("@", 1)
+        if len(local) <= 2:
+            local_masked = f"{local[0]}*" if local else "*"
+        else:
+            local_masked = f"{local[0]}{'*' * (len(local) - 2)}{local[-1]}"
+        return f"{local_masked}@{domain}"
 
     @staticmethod
     def _store_raw_message(
