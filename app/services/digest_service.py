@@ -5,6 +5,7 @@ import logging
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from textwrap import shorten
+from urllib.parse import urlparse
 from typing import Dict, List, Optional, Tuple
 
 from app.db import get_session
@@ -147,6 +148,7 @@ class DigestService:
     def _build_highlights(self, resources: List[Resource], ideas: List[Dict]) -> List[Dict]:
         highlights: List[Dict] = []
         seen_note_keys = set()
+        target_max = 5
         # 1) Prioritize strong own notes (literal snippets, no duplicates)
         sorted_ideas = sorted(
             ideas,
@@ -161,19 +163,21 @@ class DigestService:
             highlights.append(
                 {
                     "type": "note",
+                    "label": "Eigen idee",
                     "title": shorten(note["text"], width=90, placeholder="…"),
-                    "detail": "Eigen notitie – rechtstreeks uit je hoofd, dus hoogste hefboom.",
+                    "detail": "Eigen notitie met directe relevantie voor je volgende stap.",
+                    "why_relevant": "Omdat dit jouw eigen denkwerk is en direct omgezet kan worden naar actie.",
                 }
             )
             if len(highlights) >= 2:
                 break
 
-        # 2) Add successful external resources with meaningful metadata
+        # 2) Add strong external resources while filtering noise and duplicates.
         seen_urls = set()
         candidates = [
             res
             for res in resources
-            if self._is_strong_resource(res)
+            if self._is_strong_resource(res) and not self._is_noise_resource(res)
         ]
         candidates.sort(
             key=lambda r: (
@@ -183,7 +187,7 @@ class DigestService:
             reverse=True,
         )
         for res in candidates:
-            url_key = (res.canonical_url or res.final_url or res.url or "").strip()
+            url_key = self._resource_dedupe_key(res)
             if url_key in seen_urls:
                 continue
             seen_urls.add(url_key)
@@ -194,9 +198,10 @@ class DigestService:
                     "title": res.title or res.canonical_url or res.url,
                     "detail": detail_text,
                     "url": res.canonical_url or res.final_url or res.url,
+                    "why_relevant": self._resource_why_relevant(res),
                 }
             )
-            if len(highlights) >= 5:
+            if len(highlights) >= target_max:
                 break
 
         # Ensure mix: if no notes but ideas exist, pull at least one literal note
@@ -206,12 +211,14 @@ class DigestService:
                 0,
                 {
                     "type": "note",
+                    "label": "Eigen idee",
                     "title": shorten(note["text"], width=90, placeholder="…"),
-                    "detail": "Eigen notitie – koppel dit aan één concrete actie.",
+                    "detail": "Eigen notitie met directe relevantie voor je volgende stap.",
+                    "why_relevant": "Omdat dit jouw eigen denkwerk is en direct omgezet kan worden naar actie.",
                 },
             )
-            highlights = highlights[:5]
-        return highlights[:5]
+            highlights = highlights[:target_max]
+        return highlights[:target_max]
 
     def _plain_text_notes(self, messages: List[RawMessage]) -> List[Dict]:
         notes = []
@@ -236,27 +243,26 @@ class DigestService:
         actions: List[str] = []
 
         if notes:
-            for note in notes[:2]:
+            for note in notes[:1]:
                 snippet = shorten(note["text"], width=70, placeholder="…")
-                actions.append(f"Blokkeer 20 minuten en werk '{snippet}' uit tot een concreet experiment.")
+                actions.append(f"Werk dit idee uit in 5 bullets: '{snippet}'.")
         else:
-            actions.append("Plan deze week twee korte schrijfblokken – je hebt veel input maar geen eigen notities vastgelegd.")
+            actions.append("Schrijf vandaag 1 eigen notitie in 5 bullets op basis van je belangrijkste bron.")
 
         resource_highlights = [hl for hl in highlights if hl.get("type") == "resource"]
         for hl in resource_highlights[:2]:
-            actions.append(f"Lees '{hl['title']}' opnieuw en schrijf direct 3 toepasbare lessen in je inbox.")
+            actions.append(f"Lees '{hl['title']}' en noteer 3 inzichten die je deze week toepast.")
+            if len(actions) >= 3:
+                break
 
         short_ratio = themes.get("short_ratio", 0.0)
-        if links.get("videos") and short_ratio >= 0.5:
-            actions.append("Kies één video/short en vervang die door een langer artikel met dezelfde thematiek.")
-
-        if themes.get("platform_story"):
-            actions.append(themes["platform_story"])
+        if len(actions) < 3 and links.get("videos") and short_ratio >= 0.5:
+            actions.append("Kies 1 korte video en vervang die vandaag door 1 long-form artikel over hetzelfde onderwerp.")
 
         if len(actions) < 3:
-            actions.append("Kies één highlight en plan vandaag nog een micro-actie (lees, schets of deel).")
+            actions.append("Kies 1 highlight en vat die samen in 3 concrete lessen voor morgen.")
 
-        return actions[:5]
+        return actions[:3]
 
     def _build_reflection(
         self,
@@ -289,7 +295,14 @@ class DigestService:
         else:
             format_comment = "Weinig gelabelde formats – log meer context zodat je patronen ziet."
 
-        return f"{focus} {format_comment} Hefboom voor komende week: {lever}"
+        if short_ratio >= 0.5 and notes == 0:
+            observation = "Duidelijke observatie: je consumeert veel korte content maar schrijft weinig."
+        elif notes > external_resources:
+            observation = "Duidelijke observatie: je schrijft meer eigen ideeën dan dat je links consumeert."
+        else:
+            observation = "Duidelijke observatie: je input is vooral consumptie, met beperkte eigen uitwerking."
+
+        return f"{focus} {format_comment} {observation} Hefboom voor komende week: {lever}"
 
     def _build_meta_analysis(
         self,
@@ -433,6 +446,36 @@ class DigestService:
         has_meta = bool(res.title or res.description)
         text_length = len((res.extracted_text or "").strip())
         return has_meta or text_length >= 180
+
+    def _is_noise_resource(self, res: Resource) -> bool:
+        url = (res.canonical_url or res.final_url or res.url or "").strip().lower()
+        if not url:
+            return True
+        domain = (res.domain or "").lower()
+        title = (res.title or "").strip().lower()
+        if "consent.youtube.com" in domain:
+            return True
+        if url.endswith("/posts/") or url.endswith("/feed/"):
+            return True
+        if title in {"", "untitled"} and len((res.extracted_text or "").strip()) < 60:
+            return True
+        return False
+
+    def _resource_dedupe_key(self, res: Resource) -> str:
+        raw = (res.canonical_url or res.final_url or res.url or "").strip().lower()
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        normalized = f"{parsed.netloc}{parsed.path}".rstrip("/")
+        return normalized or raw
+
+    def _resource_why_relevant(self, res: Resource) -> str:
+        fmt = (res.content_format or "").lower()
+        if fmt in {"web_article", "generic_webpage", "linkedin_post"}:
+            return "Omdat deze bron inhoudelijk genoeg is om concrete lessen uit te halen."
+        if fmt in {"youtube_video", "youtube_short", "instagram_reel", "instagram_post"}:
+            return "Omdat dit onderwerp terugkomt in je input en vraagt om gerichte verdieping."
+        return "Omdat dit aansluit op je actuele kennisstroom en direct toepasbaar kan zijn."
 
     def _format_label(self, content_format: Optional[str]) -> str:
         if not content_format:
