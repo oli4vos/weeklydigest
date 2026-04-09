@@ -172,6 +172,16 @@ Gebruik `--dry-run` om alleen te genereren en de e-mailtekst te printen zonder t
 
 Rapporten blijven historisch opgeslagen; er zijn statusvelden (`generated`, `sent`) plus `generated_at`/`sent_at`. Hierdoor kun je lokaal meerdere weken aanmaken en later automatiseren.
 
+### Regelgebaseerde intelligence-laag (zonder AI)
+Digest-opbouw gebruikt nu extra heuristieken via `app/services/rules_engine.py`:
+- tweetalige topic-classificatie (NL + EN), o.a. `ai`, `legal_tech`, `productivity`, `business`, `knowledge_management`
+- item type classificatie: `idea`, `task`, `question`, `reflection`, `resource`, `inspiration`, `note`, `other`
+- deterministische `importance_score` (0-10)
+- signalen voor `is_consumption` vs `is_thinking`
+- signalen voor `content_depth` (`short_form`, `long_form`, `unknown`)
+
+Deze signalen worden gebruikt in highlights/thema’s/actiepunten/reflectie, zodat digestkwaliteit verbetert zonder modelkosten.
+
 ### Optionele AI digest enhancement
 - De deterministische pipeline blijft leidend.
 - Na heuristische digest-opbouw kan optioneel één OpenAI-call de formulering aanscherpen.

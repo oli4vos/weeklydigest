@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha1
 from textwrap import shorten
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from app.config import get_settings
@@ -16,6 +16,7 @@ from app.models import RawMessage, Resource, WeeklyReport
 from app.repositories.weekly_report_repository import WeeklyReportRepository
 from app.schemas import AIDigestPayload
 from app.services.ai_digest_service import AIDigestService, is_ai_enabled
+from app.services.rules_engine import RulesEngine
 from app.utils.datetime_utils import format_datetime_for_display
 
 
@@ -24,6 +25,7 @@ class DigestService:
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(__name__)
+        self.rules_engine = RulesEngine()
 
     def generate_report(
         self,
@@ -116,19 +118,42 @@ class DigestService:
         message_count = len(messages)
         resource_count = len(resources)
         ideas = self._plain_text_notes(messages)
+        analyzed_notes = self._analyze_note_items(ideas)
         note_count = len(ideas)
         external_resources = [
             res for res in resources if not (res.platform == "telegram" and res.content_format == "plain_text")
         ]
+        analyzed_resources = self._analyze_resource_items(external_resources)
         platform_counts = Counter((res.platform or "unknown") for res in external_resources)
         format_counts = Counter((res.content_format or "unknown") for res in external_resources)
         domain_counts = Counter((res.domain or "unknown") for res in external_resources)
+        topic_counts = Counter(item.get("primary_topic") for item in analyzed_resources + analyzed_notes if item.get("primary_topic"))
+        self.rules_engine.apply_topic_recurrence_boost(analyzed_notes, topic_counts)
+        self.rules_engine.apply_topic_recurrence_boost(analyzed_resources, topic_counts)
+        self._apply_duplicate_score_penalty(analyzed_resources)
+        item_type_counts = Counter(item.get("item_type") for item in analyzed_resources + analyzed_notes if item.get("item_type"))
+        thinking_count = sum(1 for item in analyzed_resources + analyzed_notes if item.get("is_thinking"))
+        consumption_count = sum(1 for item in analyzed_resources + analyzed_notes if item.get("is_consumption"))
+        short_form_count = sum(1 for item in analyzed_resources + analyzed_notes if item.get("content_depth") == "short_form")
+        long_form_count = sum(1 for item in analyzed_resources + analyzed_notes if item.get("content_depth") == "long_form")
 
-        highlights, duplicates_filtered_count = self._build_highlights(external_resources, ideas)
-        themes = self._build_themes(platform_counts, format_counts, domain_counts, note_count, len(external_resources))
+        highlights, duplicates_filtered_count = self._build_highlights(analyzed_resources, analyzed_notes)
+        themes = self._build_themes(
+            platform_counts,
+            format_counts,
+            domain_counts,
+            topic_counts,
+            item_type_counts,
+            note_count,
+            len(external_resources),
+            thinking_count,
+            consumption_count,
+            short_form_count,
+            long_form_count,
+        )
         themes["duplicates_filtered_count"] = duplicates_filtered_count
         links_overview = self._links_overview(external_resources)
-        actions = self._action_items(ideas, highlights, themes, links_overview)
+        actions = self._action_items(analyzed_notes, analyzed_resources, highlights, themes, links_overview)
         reflection = self._build_reflection(message_count, len(external_resources), note_count, themes, links_overview)
         meta_analysis = self._build_meta_analysis(previous, message_count, resource_count)
         intro_summary = self._intro_summary(message_count, len(external_resources), note_count)
@@ -259,15 +284,15 @@ class DigestService:
             )
         return mapped or fallback
 
-    def _build_highlights(self, resources: List[Resource], ideas: List[Dict]) -> Tuple[List[Dict], int]:
+    def _build_highlights(self, resources: List[Dict[str, Any]], ideas: List[Dict[str, Any]]) -> Tuple[List[Dict], int]:
         highlights: List[Dict] = []
         duplicates_filtered_count = 0
         seen_note_keys = set()
         target_max = 5
-        # 1) Prioritize strong own notes (literal snippets, no duplicates)
+        # 1) Prioritize high-value own notes first.
         sorted_ideas = sorted(
             ideas,
-            key=lambda n: (len(n["text"]), n["received_at"]),
+            key=lambda n: (n.get("importance_score", 0), len(n["text"]), n["received_at"]),
             reverse=True,
         )
         for note in sorted_ideas:
@@ -280,8 +305,11 @@ class DigestService:
                     "type": "note",
                     "label": "Eigen idee",
                     "title": shorten(note["text"], width=90, placeholder="…"),
-                    "detail": "Eigen notitie met directe relevantie voor je volgende stap.",
-                    "why_relevant": "Omdat dit jouw eigen denkwerk is en direct omgezet kan worden naar actie.",
+                    "detail": f"{note.get('item_type', 'note')} · topic={note.get('primary_topic', 'overig')} · score={note.get('importance_score', 0)}/10",
+                    "why_relevant": "Eigen denkwerk met hoge impact op je volgende acties.",
+                    "importance_score": note.get("importance_score", 0),
+                    "primary_topic": note.get("primary_topic", "knowledge_management"),
+                    "item_type": note.get("item_type", "note"),
                 }
             )
             if len(highlights) >= 2:
@@ -291,18 +319,20 @@ class DigestService:
         seen_resource_keys = set()
         seen_titles_by_base_key: Dict[str, set[str]] = {}
         candidates = [
-            res
-            for res in resources
-            if self._is_strong_resource(res) and not self._is_noise_resource(res)
+            item
+            for item in resources
+            if self._is_strong_resource(item["resource"]) and not self._is_noise_resource(item["resource"])
         ]
         candidates.sort(
-            key=lambda r: (
-                (r.fetched_at or datetime.min),
-                len((r.description or r.extracted_text or "")[:240]),
+            key=lambda item: (
+                item.get("importance_score", 0),
+                (item["resource"].fetched_at or datetime.min),
+                len((item["resource"].description or item["resource"].extracted_text or "")[:240]),
             ),
             reverse=True,
         )
-        for res in candidates:
+        for item in candidates:
+            res = item["resource"]
             base_key = self._resource_dedupe_key(res)
             dedupe_key = base_key
             if not dedupe_key:
@@ -327,9 +357,12 @@ class DigestService:
                 {
                     "type": "resource",
                     "title": res.title or res.canonical_url or res.url,
-                    "detail": detail_text,
+                    "detail": f"{detail_text} · {item.get('item_type', 'resource')} · topic={item.get('primary_topic', 'media')} · score={item.get('importance_score', 0)}/10",
                     "url": res.canonical_url or res.final_url or res.url,
-                    "why_relevant": self._resource_why_relevant(res),
+                    "why_relevant": self._resource_why_relevant(res, signal=item),
+                    "importance_score": item.get("importance_score", 0),
+                    "primary_topic": item.get("primary_topic", "media"),
+                    "item_type": item.get("item_type", "resource"),
                 }
             )
             if len(highlights) >= target_max:
@@ -344,8 +377,11 @@ class DigestService:
                     "type": "note",
                     "label": "Eigen idee",
                     "title": shorten(note["text"], width=90, placeholder="…"),
-                    "detail": "Eigen notitie met directe relevantie voor je volgende stap.",
-                    "why_relevant": "Omdat dit jouw eigen denkwerk is en direct omgezet kan worden naar actie.",
+                    "detail": f"{note.get('item_type', 'note')} · topic={note.get('primary_topic', 'overig')} · score={note.get('importance_score', 0)}/10",
+                    "why_relevant": "Eigen denkwerk met hoge impact op je volgende acties.",
+                    "importance_score": note.get("importance_score", 0),
+                    "primary_topic": note.get("primary_topic", "knowledge_management"),
+                    "item_type": note.get("item_type", "note"),
                 },
             )
             highlights = highlights[:target_max]
@@ -364,9 +400,45 @@ class DigestService:
             )
         return notes[:10]
 
+    def _analyze_note_items(self, notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        analyzed: List[Dict[str, Any]] = []
+        for note in notes:
+            signals = self.rules_engine.analyze_note(note.get("text", ""))
+            enriched = dict(note)
+            enriched.update(signals.as_dict())
+            analyzed.append(enriched)
+        return analyzed
+
+    def _analyze_resource_items(self, resources: List[Resource]) -> List[Dict[str, Any]]:
+        analyzed: List[Dict[str, Any]] = []
+        for resource in resources:
+            related_text = ""
+            raw_message = getattr(resource, "raw_message", None)
+            if raw_message and raw_message.text:
+                related_text = raw_message.text
+            signals = self.rules_engine.analyze_resource(resource, related_text=related_text)
+            analyzed.append({"resource": resource, **signals.as_dict()})
+        return analyzed
+
+    def _apply_duplicate_score_penalty(self, analyzed_resources: List[Dict[str, Any]]) -> None:
+        key_counts = Counter(
+            self._resource_dedupe_key(item["resource"])
+            for item in analyzed_resources
+            if self._resource_dedupe_key(item["resource"])
+        )
+        seen_per_key: Counter[str] = Counter()
+        for item in analyzed_resources:
+            key = self._resource_dedupe_key(item["resource"])
+            if not key:
+                continue
+            seen_per_key[key] += 1
+            if key_counts[key] > 1 and seen_per_key[key] > 1:
+                item["importance_score"] = max(0, int(item.get("importance_score", 0)) - 2)
+
     def _action_items(
         self,
-        notes: List[Dict],
+        notes: List[Dict[str, Any]],
+        analyzed_resources: List[Dict[str, Any]],
         highlights: List[Dict],
         themes: Dict,
         links: Dict[str, List[Dict]],
@@ -374,15 +446,23 @@ class DigestService:
         actions: List[str] = []
 
         if notes:
-            for note in notes[:1]:
+            top_notes = sorted(notes, key=lambda note: note.get("importance_score", 0), reverse=True)
+            for note in top_notes[:1]:
                 snippet = shorten(note["text"], width=70, placeholder="…")
-                actions.append(f"Werk dit idee uit in 5 bullets: '{snippet}'.")
+                actions.append(
+                    f"Werk dit {note.get('item_type', 'idee')} uit in 5 bullets: '{snippet}' (topic: {note.get('primary_topic', 'overig')})."
+                )
         else:
             actions.append("Schrijf vandaag 1 eigen notitie in 5 bullets op basis van je belangrijkste bron.")
 
-        resource_highlights = [hl for hl in highlights if hl.get("type") == "resource"]
+        resource_highlights = sorted(
+            [hl for hl in highlights if hl.get("type") == "resource"],
+            key=lambda item: item.get("importance_score", 0),
+            reverse=True,
+        )
         for hl in resource_highlights[:2]:
-            actions.append(f"Lees '{hl['title']}' en noteer 3 inzichten die je deze week toepast.")
+            topic = hl.get("primary_topic", "thema")
+            actions.append(f"Lees '{hl['title']}' gericht en noteer 3 inzichten over {topic} die je deze week toepast.")
             if len(actions) >= 3:
                 break
 
@@ -391,7 +471,20 @@ class DigestService:
             actions.append("Kies 1 korte video en vervang die vandaag door 1 long-form artikel over hetzelfde onderwerp.")
 
         if len(actions) < 3:
-            actions.append("Kies 1 highlight en vat die samen in 3 concrete lessen voor morgen.")
+            top_resource_tasks = [
+                item for item in analyzed_resources if item.get("item_type") in {"task", "question", "idea"}
+            ]
+            if top_resource_tasks:
+                best = sorted(top_resource_tasks, key=lambda item: item.get("importance_score", 0), reverse=True)[0]
+                topic = best.get("primary_topic", "thema")
+                actions.append(f"Pak je hoogste-prioriteit resource in '{topic}' en vertaal die naar 1 concrete volgende stap.")
+
+        if len(actions) < 3 and themes.get("thinking_count", 0) < themes.get("consumption_count", 0):
+            actions.append("Plan vanavond 15 minuten om je belangrijkste bron om te zetten in één eigen notitie met vervolgstap.")
+
+        if len(actions) < 3:
+            top_topic = (themes.get("top_topics") or ["je hoofdthema"])[0]
+            actions.append(f"Kies 1 highlight binnen '{top_topic}' en vat die samen in 3 concrete lessen voor morgen.")
 
         return actions[:3]
 
@@ -406,8 +499,10 @@ class DigestService:
         if messages == 0 and external_resources == 0:
             return "Geen activiteit – plan bewust tijd om ideeën en bronnen te verzamelen."
 
-        total_inputs = notes + external_resources
-        consumption_ratio = external_resources / total_inputs if total_inputs else 0
+        thinking_count = int(themes.get("thinking_count", 0) or 0)
+        consumption_count = int(themes.get("consumption_count", 0) or 0)
+        total_inputs = max(thinking_count + consumption_count, notes + external_resources)
+        consumption_ratio = (consumption_count / total_inputs) if total_inputs else 0
         if consumption_ratio >= 0.7:
             focus = "Je week was consumptiegedreven; veel externe input maar weinig eigen verwerking."
             lever = "pak één bron en schrijf er een eigen take bij."
@@ -418,7 +513,7 @@ class DigestService:
             focus = "Er was een gezonde mix tussen externe bronnen en eigen notities."
             lever = "zorg dat minstens één link of idee eindigt in een concrete actie."
 
-        short_ratio = themes.get("short_ratio", 0.0)
+        short_ratio = float(themes.get("short_ratio", 0.0) or 0.0)
         if short_ratio >= 0.6:
             format_comment = "Veel short-form content; vertraag bewust zodat inzichten blijven hangen."
         elif themes.get("content_formats"):
@@ -426,12 +521,13 @@ class DigestService:
         else:
             format_comment = "Weinig gelabelde formats – log meer context zodat je patronen ziet."
 
+        top_topic = (themes.get("top_topics") or ["overig"])[0]
         if short_ratio >= 0.5 and notes == 0:
             observation = "Duidelijke observatie: je consumeert veel korte content maar schrijft weinig."
-        elif notes > external_resources:
-            observation = "Duidelijke observatie: je schrijft meer eigen ideeën dan dat je links consumeert."
+        elif thinking_count > consumption_count:
+            observation = f"Duidelijke observatie: je verwerkt actief in eigen woorden, vooral rond '{top_topic}'."
         else:
-            observation = "Duidelijke observatie: je input is vooral consumptie, met beperkte eigen uitwerking."
+            observation = f"Duidelijke observatie: je input is vooral consumptie, met beperkte eigen uitwerking rond '{top_topic}'."
 
         return f"{focus} {format_comment} {observation} Hefboom voor komende week: {lever}"
 
@@ -472,15 +568,29 @@ class DigestService:
         platform_counts: Counter,
         format_counts: Counter,
         domain_counts: Counter,
+        topic_counts: Counter,
+        item_type_counts: Counter,
         note_count: int,
         external_count: int,
+        thinking_count: int,
+        consumption_count: int,
+        short_form_count: int,
+        long_form_count: int,
     ) -> Dict:
         story_chunks: List[str] = []
-        total_inputs = note_count + external_count
         short_formats = {"youtube_short", "instagram_reel"}
         long_formats = {"web_article", "generic_webpage", "linkedin_post"}
         short_total = sum(format_counts.get(fmt, 0) for fmt in short_formats)
         long_total = sum(format_counts.get(fmt, 0) for fmt in long_formats)
+        short_total = max(short_total, short_form_count)
+        long_total = max(long_total, long_form_count)
+
+        if topic_counts:
+            top_topic, topic_count = topic_counts.most_common(1)[0]
+            story_chunks.append(f"Dominant onderwerp: {top_topic} ({topic_count} signalen).")
+        if item_type_counts:
+            top_type, type_count = item_type_counts.most_common(1)[0]
+            story_chunks.append(f"Meest voorkomende intentie: {top_type} ({type_count} items).")
 
         if external_count == 0 and note_count > 0:
             story_chunks.append("Je week draaide volledig om eigen notities – perfect moment om een idee live te brengen.")
@@ -501,6 +611,11 @@ class DigestService:
             story_chunks.append("Er ontbreken eigen notities – schrijf na de belangrijkste link kort je eigen take.")
         elif note_count > external_count:
             story_chunks.append("Eigen denkwerk weegt zwaarder dan links; kies een kanaal om dit te delen.")
+        if thinking_count and consumption_count:
+            if thinking_count > consumption_count:
+                story_chunks.append("Je thinking-signalen zijn sterker dan consumptie; dit is een goed moment om output te publiceren.")
+            elif consumption_count > thinking_count:
+                story_chunks.append("Consumptie domineert thinking; plan bewust een vertaalslag naar eigen notities.")
 
         platform_story = ""
         if platform_counts:
@@ -527,6 +642,12 @@ class DigestService:
             "short_ratio": (short_total / max(external_count, 1)) if external_count else 0.0,
             "note_count": note_count,
             "external_count": external_count,
+            "top_topics": [topic for topic, _ in topic_counts.most_common(5)],
+            "item_types": item_type_counts.most_common(5),
+            "thinking_count": thinking_count,
+            "consumption_count": consumption_count,
+            "short_form_count": short_total,
+            "long_form_count": long_total,
         }
 
     def _links_overview(self, resources: List[Resource]) -> Dict[str, List[Dict]]:
@@ -642,13 +763,24 @@ class DigestService:
         normalized = re.sub(r"[^a-z0-9 ]+", "", normalized)
         return normalized[:120]
 
-    def _resource_why_relevant(self, res: Resource) -> str:
+    def _resource_why_relevant(self, res: Resource, *, signal: Optional[Dict[str, Any]] = None) -> str:
         fmt = (res.content_format or "").lower()
+        topic = (signal or {}).get("primary_topic", "")
+        score = (signal or {}).get("importance_score")
         if fmt in {"web_article", "generic_webpage", "linkedin_post"}:
-            return "Omdat deze bron inhoudelijk genoeg is om concrete lessen uit te halen."
-        if fmt in {"youtube_video", "youtube_short", "instagram_reel", "instagram_post"}:
-            return "Omdat dit onderwerp terugkomt in je input en vraagt om gerichte verdieping."
-        return "Omdat dit aansluit op je actuele kennisstroom en direct toepasbaar kan zijn."
+            base = "Omdat deze bron inhoudelijk genoeg is om concrete lessen uit te halen."
+        elif fmt in {"youtube_video", "youtube_short", "instagram_reel", "instagram_post"}:
+            base = "Omdat dit onderwerp terugkomt in je input en vraagt om gerichte verdieping."
+        else:
+            base = "Omdat dit aansluit op je actuele kennisstroom en direct toepasbaar kan zijn."
+        suffix = []
+        if topic:
+            suffix.append(f"topic={topic}")
+        if score is not None:
+            suffix.append(f"score={score}/10")
+        if suffix:
+            return f"{base} ({', '.join(suffix)})"
+        return base
 
     def _format_label(self, content_format: Optional[str]) -> str:
         if not content_format:
