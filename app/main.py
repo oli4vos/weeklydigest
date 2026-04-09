@@ -21,12 +21,25 @@ from app.services.digest_service import DigestService
 from app.services.email_service import EmailService
 from app.services.extraction_service import ExtractionService
 from app.services.telegram_service import TelegramService
+from app.utils.datetime_utils import format_datetime_for_display
 
 settings = get_settings()
 templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 app = FastAPI(title="Knowledge Inbox")
 security = HTTPBasic()
 logger = logging.getLogger(__name__)
+
+
+def _format_datetime_for_template(value: object) -> str:
+    """Format datetime values for UI display in APP_TIMEZONE."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return format_datetime_for_display(value)
+    return str(value)
+
+
+templates.env.filters["dt_local"] = _format_datetime_for_template
 
 
 def get_db_session() -> Iterator[Session]:

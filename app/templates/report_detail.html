@@ -5,8 +5,8 @@
   <p><strong>Onderwerp:</strong> {{ report.email_subject or "Weekly Digest" }}</p>
   <p><strong>Periode:</strong> {{ report.week_start }} → {{ report.week_end }}</p>
   <p><strong>Status:</strong> {{ report.status or "generated" }}</p>
-  <p><strong>Generated at:</strong> {{ report.generated_at or "–" }}</p>
-  <p><strong>Sent at:</strong> {{ report.sent_at or "–" }}</p>
+  <p><strong>Generated at:</strong> {% if report.generated_at %}{{ report.generated_at | dt_local }}{% else %}–{% endif %}</p>
+  <p><strong>Sent at:</strong> {% if report.sent_at %}{{ report.sent_at | dt_local }}{% else %}–{% endif %}</p>
 </div>
 
 <div class="card">

@@ -20,8 +20,8 @@
         <td>{{ report.id }}</td>
         <td>{{ report.week_start }} → {{ report.week_end }}</td>
         <td>{{ report.status or "generated" }}</td>
-        <td>{{ report.generated_at or "–" }}</td>
-        <td>{{ report.sent_at or "–" }}</td>
+        <td>{% if report.generated_at %}{{ report.generated_at | dt_local }}{% else %}–{% endif %}</td>
+        <td>{% if report.sent_at %}{{ report.sent_at | dt_local }}{% else %}–{% endif %}</td>
         <td><a href="/reports/{{ report.id }}">details</a></td>
       </tr>
       {% endfor %}
