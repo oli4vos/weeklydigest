@@ -186,10 +186,17 @@ def run_extraction(_: None = Depends(require_auth)) -> RedirectResponse:
 @app.post("/telegram/webhook")
 def telegram_webhook(payload: dict = Body(...)) -> dict:
     try:
-        handled = TelegramService.store_from_payload(payload)
+        result = TelegramService.process_webhook_payload(payload)
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"ok": True, "handled": handled}
+    return {
+        "ok": True,
+        "handled": bool(result.get("handled")),
+        "responses_sent": int(result.get("responses_sent", 0)),
+        "responses_failed": int(result.get("responses_failed", 0)),
+        "stored": bool(result.get("stored", False)),
+        "onboarding_status": result.get("onboarding_status"),
+    }
 
 
 @app.get("/health")

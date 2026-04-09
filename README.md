@@ -261,6 +261,7 @@ curl \"https://api.telegram.org/bot<token>/setWebhook?url=https://<tunnel-domain
 ```
 
 Nieuwe berichten worden via `TelegramService.store_from_payload` verwerkt (inclusief onboarding, e-mailverificatie en optionele contact-share), waardoor polling optioneel blijft.
+Webhook en polling gebruiken dezelfde verwerkingslogica; `/start`, e-mailprompt, verificatiecodes en `/resend` werken dus in beide modi.
 
 ### Config
 - `DEFAULT_USER_ID` bepaalt de fallback user voor handmatige scripts.

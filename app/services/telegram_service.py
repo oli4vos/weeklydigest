@@ -44,6 +44,12 @@ class ProcessingResult:
     onboarding_status: str
 
 
+@dataclass
+class DispatchStats:
+    sent: int = 0
+    failed: int = 0
+
+
 class TelegramService:
     """Encapsulates polling/webhook intake, onboarding, and persistence."""
 
@@ -146,8 +152,7 @@ class TelegramService:
                 display_name=display_name,
             )
             user.last_seen_at = received_at
-            if not user.onboarding_status:
-                user.onboarding_status = STATUS_NEW
+            self._normalize_onboarding_state(user)
 
             if contact_phone:
                 responses.extend(self._handle_contact_share(user, contact_phone, contact_user_id, telegram_user_id))
@@ -203,6 +208,7 @@ class TelegramService:
     def _handle_start_command(self, user: User) -> list[OutboundMessage]:
         responses: list[OutboundMessage] = []
         first_name = (user.display_name or "daar").split(" ")[0]
+        self._normalize_onboarding_state(user)
         if user.email_verified:
             user.onboarding_status = STATUS_ACTIVE
             responses.append(
@@ -219,7 +225,7 @@ class TelegramService:
                 )
             return responses
 
-        if user.onboarding_status in {STATUS_NEW, STATUS_AWAITING_EMAIL} or not user.email:
+        if not user.email:
             user.onboarding_status = STATUS_AWAITING_EMAIL
             responses.append(
                 OutboundMessage(
@@ -231,7 +237,7 @@ class TelegramService:
                     "Na verificatie ontvang je je eigen daily/weekly digest. Je berichten worden nu al opgeslagen."
                 )
             )
-        elif user.onboarding_status in {STATUS_AWAITING_EMAIL_VERIFICATION, STATUS_AWAITING_PHONE}:
+        elif not user.email_verified:
             user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
             responses.append(
                 OutboundMessage(
@@ -275,6 +281,7 @@ class TelegramService:
         received_at: datetime,
     ) -> tuple[bool, bool, list[OutboundMessage]]:
         responses: list[OutboundMessage] = []
+        self._normalize_onboarding_state(user)
         lowered = text.lower()
         if EMAIL_PATTERN.match(text):
             user.email = text.strip().lower()
@@ -288,7 +295,7 @@ class TelegramService:
             self._issue_and_send_verification_code(user, responses)
             return True, False, responses
 
-        if CODE_PATTERN.match(text) and user.onboarding_status == STATUS_AWAITING_EMAIL_VERIFICATION:
+        if CODE_PATTERN.match(text) and user.email and not user.email_verified:
             verification_state = self._verify_code(user, text)
             if verification_state == "ok":
                 user.email_verified = True
@@ -323,7 +330,7 @@ class TelegramService:
             responses.extend(self._handle_resend_command(user))
             return True, False, responses
 
-        if user.onboarding_status == STATUS_AWAITING_EMAIL and ("@" in text or "mail" in lowered):
+        if not user.email and ("@" in text or "mail" in lowered):
             responses.append(
                 OutboundMessage(
                     "Dat lijkt geen geldig e-mailadres. Gebruik bijvoorbeeld naam@domein.nl."
@@ -331,12 +338,20 @@ class TelegramService:
             )
             return True, False, responses
 
-        if CODE_PATTERN.match(text) and user.onboarding_status != STATUS_AWAITING_EMAIL_VERIFICATION:
-            responses.append(
-                OutboundMessage(
-                    "Ik verwacht nu eerst je e-mailadres. Daarna kun je de verificatiecode invoeren."
+        if CODE_PATTERN.match(text):
+            if not user.email:
+                responses.append(
+                    OutboundMessage(
+                        "Ik heb nog geen e-mailadres van je. Stuur eerst je e-mailadres, daarna kun je de code invoeren."
+                    )
                 )
-            )
+            else:
+                user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+                responses.append(
+                    OutboundMessage(
+                        "Deze code kon ik niet gebruiken. Controleer de 6 cijfers of gebruik /resend voor een nieuwe code."
+                    )
+                )
             return True, False, responses
 
         # Store regular content messages even before verification.
@@ -353,14 +368,14 @@ class TelegramService:
             user.onboarding_status = STATUS_AWAITING_EMAIL
             responses.append(
                 OutboundMessage(
-                    "Bericht opgeslagen. Rond onboarding af door je e-mailadres te sturen."
+                    "Bericht opgeslagen. Je account is nog niet actief: stuur je e-mailadres om door te gaan."
                 )
             )
         else:
             user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
             responses.append(
                 OutboundMessage(
-                    "Bericht opgeslagen. Verifieer je e-mail met de 6-cijferige code of gebruik /resend."
+                    "Bericht opgeslagen. Je digest wordt pas verstuurd na verificatie. Stuur je 6-cijferige code of gebruik /resend."
                 )
             )
         return True, stored, responses
@@ -409,6 +424,19 @@ class TelegramService:
                     "Ik kon nu geen verificatiecode mailen. Probeer straks opnieuw met /resend."
                 )
             )
+
+    @staticmethod
+    def _normalize_onboarding_state(user: User) -> None:
+        """Ensure onboarding status stays consistent with profile completeness."""
+        if not user.email:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            user.email_verified = False
+            return
+        if not user.email_verified:
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            return
+        # Email verified users are considered active; phone is optional.
+        user.onboarding_status = STATUS_ACTIVE
 
     def _verify_code(self, user: User, provided_code: str) -> str:
         if not user.email_verification_token_hash or not user.email_verification_sent_at:
@@ -489,12 +517,12 @@ class TelegramService:
         return None
 
     @classmethod
-    def store_from_payload(cls, payload: dict) -> bool:
+    def process_webhook_payload(cls, payload: dict) -> dict[str, object]:
         """Persist and respond to a Telegram update received via webhook."""
         settings = get_settings()
         message = payload.get("message") or payload.get("edited_message")
         if not message:
-            return False
+            return {"handled": False, "responses_sent": 0, "responses_failed": 0}
 
         from_user = message.get("from") or {}
         chat = message.get("chat") or {}
@@ -502,7 +530,7 @@ class TelegramService:
         chat_id = chat.get("id")
         if telegram_user_id is None or chat_id is None:
             logging.getLogger(__name__).warning("Webhook payload missing user/chat identifiers")
-            return False
+            return {"handled": False, "responses_sent": 0, "responses_failed": 0}
 
         text = (message.get("text") or "").strip() or None
         contact = message.get("contact") or {}
@@ -520,15 +548,30 @@ class TelegramService:
             contact_user_id=contact_user_id,
             received_at=cls._normalize_datetime(cls._from_timestamp(message.get("date"))),
         )
+        dispatch = DispatchStats()
         if result.responses:
-            service._send_webhook_responses(chat_id=str(chat_id), responses=result.responses)
-        return result.handled
+            dispatch = service._send_webhook_responses(chat_id=str(chat_id), responses=result.responses)
+        return {
+            "handled": result.handled,
+            "responses_sent": dispatch.sent,
+            "responses_failed": dispatch.failed,
+            "onboarding_status": result.onboarding_status,
+            "stored": result.stored,
+        }
 
-    def _send_webhook_responses(self, *, chat_id: str, responses: list[OutboundMessage]) -> None:
+    @classmethod
+    def store_from_payload(cls, payload: dict) -> bool:
+        """Backward-compatible bool helper used by older callers."""
+        result = cls.process_webhook_payload(payload)
+        return bool(result.get("handled"))
+
+    def _send_webhook_responses(self, *, chat_id: str, responses: list[OutboundMessage]) -> DispatchStats:
         if not self.bot_token:
-            return
+            self.logger.warning("Cannot send Telegram responses: bot token missing")
+            return DispatchStats(sent=0, failed=len(responses))
         api_base = f"https://api.telegram.org/bot{self.bot_token}"
         timeout = httpx.Timeout(10.0)
+        stats = DispatchStats()
         with httpx.Client(timeout=timeout) as client:
             for outbound in responses:
                 payload: dict[str, object] = {
@@ -542,9 +585,35 @@ class TelegramService:
                         "one_time_keyboard": True,
                     }
                 try:
-                    client.post(f"{api_base}/sendMessage", json=payload)
+                    response = client.post(f"{api_base}/sendMessage", json=payload)
+                    if response.status_code >= 400:
+                        stats.failed += 1
+                        self.logger.warning(
+                            "Telegram sendMessage failed for chat=%s status=%s body=%s",
+                            chat_id,
+                            response.status_code,
+                            response.text[:200],
+                        )
+                        continue
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = {"ok": False}
+                    if body.get("ok") is True:
+                        stats.sent += 1
+                    else:
+                        stats.failed += 1
+                        self.logger.warning(
+                            "Telegram sendMessage returned non-ok for chat=%s body=%s",
+                            chat_id,
+                            str(body)[:200],
+                        )
                 except Exception:  # pragma: no cover
+                    stats.failed += 1
                     self.logger.exception("Failed to send Telegram response to chat %s", chat_id)
+        if stats.failed == 0 and stats.sent > 0:
+            self.logger.info("Webhook response dispatch ok chat=%s sent=%s", chat_id, stats.sent)
+        return stats
 
     @staticmethod
     def _from_timestamp(timestamp: Optional[int]) -> datetime:
