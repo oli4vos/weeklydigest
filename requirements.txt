@@ -21,3 +21,4 @@ sqlalchemy==2.0.29
 tqdm==4.67.3
 typing-extensions==4.15.0
 uvicorn==0.29.0
+psycopg2-binary==2.9.9
