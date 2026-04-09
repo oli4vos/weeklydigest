@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.config import BASE_DIR, get_settings
-from app.db import Base, engine, get_session
+from app.db import get_session
 from app.repositories.weekly_report_repository import WeeklyReportRepository
 from app.services.digest_service import DigestService
 from app.services.email_service import EmailService
@@ -165,13 +165,6 @@ def internal_run_extraction(request: Request) -> dict:
     service = ExtractionService()
     stats = service.process()
     return {"status": "processed", "stats": stats}
-
-
-@app.post("/internal/init-db")
-def internal_init_db(request: Request) -> dict:
-    require_internal_token(request)
-    Base.metadata.create_all(bind=engine)
-    return {"status": "ok", "message": "database initialized"}
 
 
 def _run_digest(days: int) -> dict:

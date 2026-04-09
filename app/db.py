@@ -9,11 +9,17 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from .config import get_settings
 
+Base = declarative_base()
+
 settings = get_settings()
 engine = create_engine(settings.database_url, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
-Base = declarative_base()
+# Import models so SQLAlchemy registers all tables on Base.metadata.
+from . import models as _models  # noqa: F401
+
+# Create any missing tables on app startup. No drop/reset.
+Base.metadata.create_all(bind=engine)
 
 
 @contextmanager
