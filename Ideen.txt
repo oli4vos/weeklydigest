@@ -1,1 +1,2 @@
 - de beschrijving van een instagram reel lezen en samenvatten
+- andere ook met de bot laten praten dmv nummer en emailadres opvragen en deze kppelen en unieke ID in database geven waardoor er naar deze mensen ook een mailtje kan
