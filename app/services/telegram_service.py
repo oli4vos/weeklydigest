@@ -18,6 +18,7 @@ from app.db import get_session
 from app.models import RawMessage, User
 from app.repositories.user_repository import UserRepository
 from app.services.email_service import EmailService
+from app.services.export_service import ExportService
 
 LINK_PATTERN = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -71,6 +72,7 @@ class TelegramService:
         application = Application.builder().token(self.bot_token).build()
         application.add_handler(CommandHandler("start", self._handle_start))
         application.add_handler(CommandHandler("resend", self._handle_resend))
+        application.add_handler(CommandHandler("export", self._handle_export))
         application.add_handler(MessageHandler(filters.CONTACT, self._handle_contact))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self._handle_text_message))
         application.add_error_handler(self._handle_error)
@@ -94,13 +96,26 @@ class TelegramService:
             return
         await self._handle_message_for_polling(message, text="/resend")
 
+    async def _handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if not message:
+            return
+        await message.reply_text("Ik maak je export klaar en mail hem naar je bekende e-mailadres.")
+        await self._handle_message_for_polling(message, text="/export", export_preface_sent=True)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.message
         if not message or not message.text:
             return
         await self._handle_message_for_polling(message, text=message.text.strip())
 
-    async def _handle_message_for_polling(self, message: Message, *, text: Optional[str] = None) -> None:
+    async def _handle_message_for_polling(
+        self,
+        message: Message,
+        *,
+        text: Optional[str] = None,
+        export_preface_sent: bool = False,
+    ) -> None:
         telegram_user = message.from_user
         if telegram_user is None:
             return
@@ -114,6 +129,7 @@ class TelegramService:
             contact_phone=(message.contact.phone_number if message.contact else None),
             contact_user_id=(str(message.contact.user_id) if message.contact and message.contact.user_id else None),
             received_at=self._normalize_datetime(message.date),
+            export_preface_sent=export_preface_sent,
         )
         for outbound in result.responses:
             kwargs = {}
@@ -140,6 +156,7 @@ class TelegramService:
         contact_phone: Optional[str],
         contact_user_id: Optional[str],
         received_at: datetime,
+        export_preface_sent: bool = False,
     ) -> ProcessingResult:
         responses: list[OutboundMessage] = []
         stored = False
@@ -169,11 +186,20 @@ class TelegramService:
             if lowered.startswith("/resend"):
                 responses.extend(self._handle_resend_command(user))
                 return ProcessingResult(True, stored, responses, user.onboarding_status)
+            if lowered.startswith("/export"):
+                responses.extend(
+                    self._handle_export_command(
+                        session=session,
+                        user=user,
+                        include_preface=not export_preface_sent,
+                    )
+                )
+                return ProcessingResult(True, stored, responses, user.onboarding_status)
 
             if lowered.startswith("/") and lowered != "/start":
                 responses.append(
                     OutboundMessage(
-                        "Onbekend commando. Gebruik /start om onboarding te zien of /resend voor een nieuwe verificatiecode."
+                        "Onbekend commando. Gebruik /start, /resend of /export."
                     )
                 )
                 return ProcessingResult(True, stored, responses, user.onboarding_status)
@@ -267,6 +293,58 @@ class TelegramService:
         user.email_verified = False
         user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
         self._issue_and_send_verification_code(user, responses)
+        return responses
+
+    def _handle_export_command(
+        self,
+        *,
+        session,
+        user: User,
+        include_preface: bool = True,
+    ) -> list[OutboundMessage]:
+        responses: list[OutboundMessage] = []
+        self._normalize_onboarding_state(user)
+        if not user.email:
+            user.onboarding_status = STATUS_AWAITING_EMAIL
+            responses.append(
+                OutboundMessage(
+                    "Voor /export heb ik eerst een geverifieerd e-mailadres nodig. Stuur eerst je e-mailadres."
+                )
+            )
+            return responses
+        if not user.email_verified:
+            user.onboarding_status = STATUS_AWAITING_EMAIL_VERIFICATION
+            responses.append(
+                OutboundMessage(
+                    "Voor /export moet je e-mailadres eerst geverifieerd zijn. Stuur je 6-cijferige code of gebruik /resend."
+                )
+            )
+            return responses
+
+        if include_preface:
+            responses.append(
+                OutboundMessage("Ik maak je export klaar en mail hem naar je bekende e-mailadres.")
+            )
+
+        try:
+            bundle = ExportService().build_user_export(session, user_id=user.id)
+            EmailService(settings=self.settings).send_export_file(
+                email_address=user.email,
+                filename=bundle.filename,
+                content=bundle.as_json_bytes(),
+            )
+            responses.append(
+                OutboundMessage(
+                    f"✅ Je export is gemaild naar {self._mask_email(user.email)}."
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            self.logger.exception("Failed to build/send export for user=%s: %s", user.id, exc)
+            responses.append(
+                OutboundMessage(
+                    "❌ Het is niet gelukt om je export te mailen. Probeer later opnieuw met /export."
+                )
+            )
         return responses
 
     def _handle_pre_verification_text(

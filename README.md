@@ -59,6 +59,7 @@ python scripts/migrate_user_onboarding.py
    ```
 5. Stuur `/start` naar je bot om onboarding te starten (e-mail invoeren + code verifiëren).
    - Bij een foute of verlopen code kun je altijd `/resend` sturen.
+   - Met `/export` mailt de bot een JSON-export van al je eigen historische data (berichten, resources, reports, optioneel knowledge items).
 6. Na onboarding worden tekstberichten opgeslagen in `raw_messages` met `source='telegram'`. Links worden gedetecteerd via regex en gemarkeerd in `contains_link`.
 
 ### Multi-user basis
@@ -261,7 +262,7 @@ curl \"https://api.telegram.org/bot<token>/setWebhook?url=https://<tunnel-domain
 ```
 
 Nieuwe berichten worden via `TelegramService.store_from_payload` verwerkt (inclusief onboarding, e-mailverificatie en optionele contact-share), waardoor polling optioneel blijft.
-Webhook en polling gebruiken dezelfde verwerkingslogica; `/start`, e-mailprompt, verificatiecodes en `/resend` werken dus in beide modi.
+Webhook en polling gebruiken dezelfde verwerkingslogica; `/start`, e-mailprompt, verificatiecodes, `/resend` en `/export` werken dus in beide modi.
 
 ### Config
 - `DEFAULT_USER_ID` bepaalt de fallback user voor handmatige scripts.

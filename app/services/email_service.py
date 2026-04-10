@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import smtplib
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import escape
 from textwrap import shorten
@@ -44,6 +45,45 @@ class EmailService:
             smtp.send_message(msg)
 
         self.logger.info("Sent weekly report %s to %s", report.id, recipient)
+
+    def send_export_file(
+        self,
+        *,
+        email_address: str,
+        filename: str,
+        content: bytes,
+    ) -> None:
+        """Send a user data export as JSON attachment."""
+        if not self.settings.smtp_host:
+            raise RuntimeError("SMTP_HOST is not configured")
+        if not email_address:
+            raise RuntimeError("Target email address is required")
+
+        msg = EmailMessage()
+        msg["Subject"] = f"Jouw knowledge export {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+        msg["From"] = self.settings.email_from or self.settings.smtp_username or "noreply@example.com"
+        msg["To"] = email_address
+        msg.set_content(
+            "Hierbij ontvang je je Knowledge Inbox export als JSON-bijlage.\n"
+            "De export bevat alleen je eigen historische data uit dit systeem."
+        )
+        msg.add_attachment(
+            content,
+            maintype="application",
+            subtype="json",
+            filename=filename,
+        )
+
+        with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port) as smtp:
+            smtp.ehlo()
+            if self.settings.smtp_port not in (25, 2525) and self.settings.smtp_host not in {"localhost", "127.0.0.1"}:
+                smtp.starttls()
+                smtp.ehlo()
+            if self.settings.smtp_username and self.settings.smtp_password:
+                smtp.login(self.settings.smtp_username, self.settings.smtp_password)
+            smtp.send_message(msg)
+
+        self.logger.info("Sent export attachment to user email destination")
 
     def send_verification_code(
         self,
